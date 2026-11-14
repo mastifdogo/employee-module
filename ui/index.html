@@ -1,0 +1,841 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Employees</title>
+<style>
+	:root { --bg: #fff; --soft: #f5f7f9; --text: #1d232b; --muted: #5d6875; --border: #dde1e6; --accent: #1f6feb; --danger: #cf222e; --ok: #1a7f37; --warn: #9a6700; color-scheme: light; }
+	@media (prefers-color-scheme: dark) {
+		:root { --bg: #171b21; --soft: #1e242c; --text: #e3e7ec; --muted: #97a1ad; --border: #2c333c; --accent: #4c8dff; --danger: #ff7b72; --ok: #56d364; --warn: #e3b341; color-scheme: dark; }
+	}
+	* { box-sizing: border-box; }
+	body { margin: 0; padding: 1rem 1.25rem 3rem; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
+	h1 { font-size: 1.4rem; margin: 0; }
+	h2 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem; }
+	p { margin: 0.4rem 0; }
+	.top { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center; justify-content: space-between; }
+	.tiles { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.9rem 0; }
+	.tile { flex: 1 1 8.5rem; border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.7rem; }
+	.tile b { display: block; font-size: 1.15rem; font-variant-numeric: tabular-nums; }
+	.tile span, .muted, small { color: var(--muted); }
+	small { font-size: 0.82rem; }
+	nav { display: flex; gap: 0.15rem; overflow-x: auto; border-bottom: 1px solid var(--border); margin-bottom: 1rem; }
+	nav button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; color: var(--muted); padding: 0.45rem 0.7rem; white-space: nowrap; }
+	nav button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+	.row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; margin: 0.6rem 0; }
+	label { display: flex; flex-direction: column; gap: 0.15rem; font-size: 0.8rem; color: var(--muted); flex: 1 1 8rem; min-width: 0; }
+	label.check { flex-direction: row; align-items: center; gap: 0.4rem; font-size: 0.95rem; color: var(--text); flex: 0 0 auto; padding-bottom: 0.4rem; }
+	input, select, textarea { width: 100%; padding: 0.4rem 0.55rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+	input[type="checkbox"] { width: auto; }
+	input.num { text-align: right; min-width: 5.5rem; }
+	button { padding: 0.4rem 0.8rem; border: 1px solid var(--accent); border-radius: 6px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+	button.plain { background: transparent; color: var(--accent); border-color: var(--border); }
+	button.danger { background: transparent; color: var(--danger); border-color: var(--border); }
+	button.small { padding: 0.15rem 0.5rem; font-size: 0.85rem; }
+	button:disabled { opacity: 0.55; cursor: default; }
+	.scroll { overflow-x: auto; }
+	table { width: 100%; border-collapse: collapse; }
+	th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+	th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.02em; color: var(--muted); white-space: nowrap; }
+	td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+	tfoot td { font-weight: 600; border-bottom: 0; }
+	.chip { display: inline-block; padding: 0 0.45rem; border: 1px solid var(--border); border-radius: 999px; font-size: 0.75rem; color: var(--muted); white-space: nowrap; }
+	.chip.ok { color: var(--ok); } .chip.warn { color: var(--warn); } .chip.bad { color: var(--danger); }
+	.card { border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem 0.9rem; margin: 0.75rem 0; }
+	.card > h3 { margin: 0 0 0.3rem; font-size: 1rem; display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: space-between; align-items: center; }
+	.note { background: var(--soft); border-radius: 6px; padding: 0.55rem 0.75rem; margin: 0.6rem 0; }
+	#msg { position: sticky; top: 0; z-index: 2; }
+	#msg div { padding: 0.5rem 0.75rem; border-radius: 6px; margin-bottom: 0.6rem; background: var(--soft); border: 1px solid var(--border); }
+	#msg .error { color: var(--danger); border-color: var(--danger); }
+	dialog { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); padding: 1rem 1.1rem; width: min(34rem, calc(100vw - 1.5rem)); }
+	dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+	dialog h2 { margin-top: 0; }
+	dialog .row { align-items: start; }
+	.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; }
+	a { color: var(--accent); }
+	[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="top">
+	<h1>Employees</h1>
+	<button id="syncTop" class="plain" hidden>Sync timesheet.io</button>
+</div>
+<div class="tiles" id="tiles"></div>
+<div id="msg"></div>
+<nav id="tabs" role="tablist"></nav>
+<main id="main"></main>
+<dialog id="dlg"></dialog>
+
+<script>
+	"use strict";
+	// Served by Ledger at /m/employees/, so API calls carry the user's login.
+	const api = (path, opts = {}) =>
+		fetch(`/api/v1/m/employees${path}`, { ...opts, headers: { "Content-Type": "application/json", ...(opts.headers || {}) } }).then(async (r) => {
+			if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error?.message || r.statusText);
+			return r.status === 204 ? null : r.json();
+		});
+	const send = (method, path, body) => api(path, { method, body: JSON.stringify(body ?? {}) });
+
+	// h("td", { class: "n" }, "text", node…): text always goes in as text nodes, never as HTML.
+	function h(tag, props, ...kids) {
+		const el = document.createElement(tag);
+		for (const [k, v] of Object.entries(props || {})) {
+			if (v === undefined || v === null || v === false) continue;
+			if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+			else if (k === "class") el.className = v;
+			else if (k === "value") el.value = v;
+			else if (k === "checked" || k === "disabled" || k === "selected" || k === "hidden") el[k] = Boolean(v);
+			else el.setAttribute(k, v === true ? "" : v);
+		}
+		el.append(...clean(kids));
+		return el;
+	}
+	const clean = (kids) => kids.flat(Infinity).filter((c) => c !== null && c !== undefined && c !== false);
+	const put = (el, ...kids) => el.replaceChildren(...clean(kids));
+	const $ = (id) => document.getElementById(id);
+	const st = { summary: null, employees: [], projects: [], customers: [], accounts: [], tab: "time" };
+	const canEdit = () => st.summary && st.summary.role !== "viewer";
+	const cur = () => st.summary?.currency ?? "";
+	const money = (c) => `${(Number(c) / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+	const moneyC = (c) => `${money(c)} ${cur()}`;
+	const hrs = (m) => (Number(m) / 60).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+	const toCents = (v) => {
+		const n = Number(String(v).replace(/[$,\s]/g, ""));
+		if (String(v).trim() === "" || !Number.isFinite(n) || n < 0) throw new Error(`"${v}" isn't an amount`);
+		return Math.round(n * 100);
+	};
+	const dollars = (c) => (c === null || c === undefined ? "" : (Number(c) / 100).toFixed(2));
+	const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+	const today = () => iso(new Date());
+	const monthStart = () => iso(new Date(new Date().getFullYear(), new Date().getMonth(), 1));
+	const prevMonth = () => {
+		const n = new Date();
+		return [iso(new Date(n.getFullYear(), n.getMonth() - 1, 1)), iso(new Date(n.getFullYear(), n.getMonth(), 0))];
+	};
+
+	function say(text, error = false) {
+		$("msg").replaceChildren(text ? h("div", { class: error ? "error" : "", role: error ? "alert" : "status" }, text) : "");
+		if (text && !error) setTimeout(() => $("msg").firstChild?.textContent === text && $("msg").replaceChildren(), 8000);
+	}
+	const fail = (e) => say(e.message || String(e), true);
+	/** Runs an action from a button: disables it meanwhile and shows what went wrong. */
+	const act = (fn) => async (ev) => {
+		ev?.preventDefault?.();
+		const btn = ev?.submitter ?? (ev?.currentTarget instanceof HTMLButtonElement ? ev.currentTarget : null);
+		if (btn) btn.disabled = true;
+		try {
+			await fn(ev);
+		} catch (e) {
+			fail(e);
+		} finally {
+			if (btn) btn.disabled = false;
+		}
+	};
+	const field = (label, input, hint) => h("label", {}, label, input, hint && h("small", {}, hint));
+	const chip = (text, kind = "") => h("span", { class: `chip ${kind}` }, text);
+	const table = (heads, rows, foot) =>
+		h("div", { class: "scroll" }, h("table", {}, h("thead", {}, h("tr", {}, heads.map((t) => h("th", { class: t.startsWith("#") ? "n" : "" }, t.replace(/^#/, ""))))), h("tbody", {}, rows), foot && h("tfoot", {}, foot)));
+	const empty = (text) => h("p", { class: "muted" }, text);
+
+	// ---- dialogs ------------------------------------------------------------
+	function dialog(title, body, submitLabel, onSubmit) {
+		const dlg = $("dlg");
+		const err = h("p", { style: "color: var(--danger)" });
+		const form = h(
+			"form",
+			{
+				onsubmit: async (ev) => {
+					ev.preventDefault();
+					const btn = ev.submitter;
+					if (btn) btn.disabled = true;
+					try {
+						await onSubmit();
+						dlg.close();
+					} catch (e) {
+						err.textContent = e.message || String(e);
+					} finally {
+						if (btn) btn.disabled = false;
+					}
+				},
+			},
+			h("h2", {}, title),
+			body,
+			err,
+			h("div", { class: "actions" }, h("button", { type: "button", class: "plain", onclick: () => dlg.close() }, "Cancel"), submitLabel && h("button", { type: "submit" }, submitLabel)),
+		);
+		dlg.replaceChildren(form);
+		dlg.showModal();
+	}
+
+	// "+ New account…": Ledger opens its New account dialog over this page and answers with the account.
+	function newAccount(defaults = {}) {
+		const id = crypto.randomUUID();
+		return new Promise((resolve) => {
+			addEventListener("message", function on(e) {
+				if (e.origin !== location.origin || e.data?.type !== "ledger-new-account-result" || e.data.id !== id) return;
+				removeEventListener("message", on);
+				resolve(e.data.account);
+			});
+			parent.postMessage({ type: "ledger-new-account", id, defaults }, location.origin);
+		});
+	}
+
+	/** Account picker: the chart as a tree, bank and card accounts first when asked, ending with "+ New account…". */
+	function accountSelect({ types, selected, banksFirst = false, defaults = {} }) {
+		const sel = h("select", { required: true });
+		const fill = (pick) => {
+			const list = st.accounts.filter((a) => types.includes(a.type) && a.currency === cur());
+			const codes = new Set(list.map((a) => a.code));
+			const kids = new Map();
+			for (const a of list) {
+				const p = a.parent_code && codes.has(a.parent_code) ? a.parent_code : "";
+				kids.set(p, [...(kids.get(p) || []), a]);
+			}
+			const opts = [];
+			(function walk(parent, depth) {
+				for (const a of (kids.get(parent) || []).sort((x, y) => x.code.localeCompare(y.code, undefined, { numeric: true }))) {
+					opts.push(h("option", { value: a.code }, `${"   ".repeat(depth)}${a.code} · ${a.name}`));
+					walk(a.code, depth + 1);
+				}
+			})("", 0);
+			const tagged = banksFirst ? list.filter((a) => a.kind) : [];
+			put(sel, 
+				h("option", { value: "" }, "Choose an account…"),
+				tagged.length ? h("optgroup", { label: "Bank and card accounts" }, tagged.map((a) => h("option", { value: a.code }, `${a.code} · ${a.name}`))) : null,
+				tagged.length ? h("optgroup", { label: "All accounts" }, opts) : opts,
+				canEdit() ? h("option", { value: "+" }, "+ New account…") : null,
+			);
+			sel.value = pick && codes.has(pick) ? pick : "";
+		};
+		fill(selected);
+		let last = sel.value;
+		sel.addEventListener("change", async () => {
+			if (sel.value !== "+") return void (last = sel.value);
+			sel.value = last;
+			const made = await newAccount({ type: types[0], currency: cur(), ...defaults });
+			if (!made) return;
+			st.accounts.push({ code: made.code, name: made.name, type: made.type, currency: made.currency, kind: made.kind ?? null, parent_code: made.parent_code ?? null });
+			fill(made.code);
+			last = sel.value;
+		});
+		return sel;
+	}
+
+	function customerSelect(selected) {
+		const sel = h("select", {});
+		const fill = (pick) => {
+			put(sel, h("option", { value: "" }, "No customer"), st.customers.map((c) => h("option", { value: c.id }, c.name)), canEdit() ? h("option", { value: "+" }, "+ New customer…") : null);
+			sel.value = pick === null || pick === undefined ? "" : String(pick);
+		};
+		fill(selected);
+		let last = sel.value;
+		sel.addEventListener("change", async () => {
+			if (sel.value !== "+") return void (last = sel.value);
+			sel.value = last;
+			const name = prompt("Customer name (added to Ledger's Entities)");
+			if (!name?.trim()) return;
+			try {
+				const c = await send("POST", "/customers", { name });
+				if (!st.customers.some((x) => x.id === c.id)) st.customers.push(c);
+				st.customers.sort((a, b) => a.name.localeCompare(b.name));
+				fill(c.id);
+				last = sel.value;
+			} catch (e) {
+				alert(e.message);
+			}
+		});
+		return sel;
+	}
+
+	// ---- shared data ----------------------------------------------------------
+	async function loadShared() {
+		const [summary, employees, projects, customers, accounts] = await Promise.all([api("/summary"), api("/employees"), api("/projects"), api("/customers"), api("/accounts")]);
+		Object.assign(st, { summary, employees: employees.data, projects: projects.data, customers: customers.data, accounts: accounts.data });
+		drawTiles();
+	}
+	async function refreshSummary() {
+		st.summary = await api("/summary");
+		drawTiles();
+	}
+	function drawTiles() {
+		const s = st.summary;
+		const tile = (value, label) => h("div", { class: "tile" }, h("b", {}, value), h("span", {}, label));
+		$("tiles").replaceChildren(tile(String(s.employees), "active employees"), tile(`${hrs(s.unpaid_minutes)} h`, "not on a pay run yet"), tile(`${hrs(s.unbilled_minutes)} h`, "billable, not billed"), tile(moneyC(s.unbilled_cents), "to bill"));
+		$("syncTop").hidden = !(s.timesheet.configured && canEdit());
+	}
+	async function syncNow() {
+		say("Reading time from timesheet.io…");
+		const r = await send("POST", "/timesheet/sync");
+		await loadShared();
+		await show(st.tab);
+		say(r.summary);
+	}
+	$("syncTop").onclick = act(syncNow);
+
+	// ---- Time -----------------------------------------------------------------
+	const timeFilter = { from: monthStart(), to: "", employee_id: "", show: "" };
+
+	function entryForm(entry) {
+		const fromTimesheet = entry?.source === "timesheet";
+		const f = {
+			employee: h("select", { required: true, disabled: fromTimesheet }, h("option", { value: "" }, "Choose…"), st.employees.filter((e) => e.is_active || e.id === entry?.employee_id).map((e) => h("option", { value: e.id }, e.name))),
+			date: h("input", { type: "date", required: true, value: entry?.work_date ?? today(), disabled: fromTimesheet }),
+			hours: h("input", { class: "num", inputmode: "decimal", required: true, placeholder: "e.g. 7.5", value: entry ? (entry.minutes / 60).toFixed(2) : "", disabled: fromTimesheet }),
+			project: h("select", { disabled: fromTimesheet }, h("option", { value: "" }, "No project"), st.projects.filter((p) => p.is_active || p.id === entry?.project_id).map((p) => h("option", { value: p.id }, p.customer_name ? `${p.name} · ${p.customer_name}` : p.name))),
+			description: h("input", { maxlength: 2000, value: entry?.description ?? "", disabled: fromTimesheet }),
+			billable: h("input", { type: "checkbox", checked: entry?.billable ?? false, disabled: fromTimesheet }),
+			rate: h("input", { class: "num", inputmode: "decimal", placeholder: "project or employee rate", value: dollars(entry?.bill_rate_cents) }),
+		};
+		if (entry) {
+			f.employee.value = String(entry.employee_id);
+			f.project.value = entry.project_id === null ? "" : String(entry.project_id);
+		}
+		const node = h(
+			"div",
+			{},
+			fromTimesheet && h("p", { class: "note" }, "This entry comes from timesheet.io. Change it there and sync; only its billing rate can be set here."),
+			h("div", { class: "row" }, field("Employee", f.employee), field("Date", f.date), field("Hours", f.hours)),
+			h("div", { class: "row" }, field("Project", f.project), field("What was done", f.description)),
+			h("div", { class: "row" }, h("label", { class: "check" }, f.billable, "Billable"), field(`Billing rate per hour (${cur()})`, f.rate, "Leave empty to use the project's or the employee's rate.")),
+		);
+		const read = () => {
+			const rate = f.rate.value.trim() === "" ? null : toCents(f.rate.value);
+			if (fromTimesheet) return { bill_rate_cents: rate };
+			const hours = Number(f.hours.value.replace(",", "."));
+			if (!Number.isFinite(hours) || hours <= 0) throw new Error("Enter the hours worked, e.g. 7.5");
+			return { employee_id: Number(f.employee.value), work_date: f.date.value, minutes: Math.round(hours * 60), project_id: f.project.value ? Number(f.project.value) : null, description: f.description.value, billable: f.billable.checked, bill_rate_cents: rate };
+		};
+		return { node, read };
+	}
+
+	function entryStatus(t) {
+		const out = [];
+		if (t.source === "timesheet") out.push(chip("timesheet.io"));
+		if (t.billing_id !== null) out.push(chip("billed", "ok"));
+		else if (t.billable) out.push(chip("billable", "warn"));
+		if (t.pay_run_id !== null) out.push(chip("on pay run", "ok"));
+		return out;
+	}
+
+	async function showTime() {
+		const qs = new URLSearchParams(Object.entries(timeFilter).filter(([, v]) => v));
+		const { data } = await api(`/time?${qs}`);
+		const reload = () => Promise.all([showTime(), refreshSummary()]);
+		const sel = h("select", { onchange: (e) => ((timeFilter.employee_id = e.target.value), showTime().catch(fail)) }, h("option", { value: "" }, "Everyone"), st.employees.map((e) => h("option", { value: e.id }, e.name)));
+		sel.value = timeFilter.employee_id;
+		const show = h("select", { onchange: (e) => ((timeFilter.show = e.target.value), showTime().catch(fail)) }, h("option", { value: "" }, "All time"), h("option", { value: "billable" }, "Billable, not billed"), h("option", { value: "unpaid" }, "Not on a pay run"));
+		show.value = timeFilter.show;
+		const total = data.reduce((a, t) => a + t.minutes, 0);
+		put($("main"), 
+			h(
+				"div",
+				{ class: "row" },
+				field("From", h("input", { type: "date", value: timeFilter.from, onchange: (e) => ((timeFilter.from = e.target.value), showTime().catch(fail)) })),
+				field("To", h("input", { type: "date", value: timeFilter.to, onchange: (e) => ((timeFilter.to = e.target.value), showTime().catch(fail)) })),
+				field("Employee", sel),
+				field("Show", show),
+				canEdit() &&
+					h(
+						"button",
+						{
+							onclick: () => {
+								if (!st.employees.some((e) => e.is_active)) return say("Add an employee first, on the People tab.", true);
+								const f = entryForm(null);
+								dialog("Add time", f.node, "Add", async () => {
+									await send("POST", "/time", f.read());
+									await reload();
+								});
+							},
+						},
+						"Add time",
+					),
+			),
+			data.length === 0
+				? empty(st.summary.timesheet.configured ? "No time in this period. Add some, or sync timesheet.io." : "No time in this period. Add some here, or connect timesheet.io on its tab to pull it in.")
+				: table(
+						["Date", "Employee", "Project", "What", "#Hours", "#Rate", "#Amount", "", ""],
+						data.map((t) => {
+							const locked = t.billing_id !== null || t.pay_run_id !== null;
+							return h(
+								"tr",
+								{},
+								h("td", { style: "white-space: nowrap" }, t.work_date),
+								h("td", {}, t.employee_name),
+								h("td", {}, t.project_name ?? h("span", { class: "muted" }, "—")),
+								h("td", {}, t.description),
+								h("td", { class: "n" }, hrs(t.minutes)),
+								h("td", { class: "n" }, t.billable ? money(t.rate_cents) : ""),
+								h("td", { class: "n" }, t.billable ? money(t.amount_cents) : ""),
+								h("td", {}, entryStatus(t)),
+								h(
+									"td",
+									{ style: "white-space: nowrap" },
+									canEdit() &&
+										!locked && [
+											h(
+												"button",
+												{
+													class: "plain small",
+													onclick: () => {
+														const f = entryForm(t);
+														dialog("Change time", f.node, "Save", async () => {
+															await send("PATCH", `/time/${t.id}`, f.read());
+															await reload();
+														});
+													},
+												},
+												"Edit",
+											),
+											t.source === "manual" && " ",
+											t.source === "manual" && h("button", { class: "danger small", title: "Delete", onclick: act(async () => confirm(`Delete ${hrs(t.minutes)} h of ${t.employee_name} on ${t.work_date}?`) && (await api(`/time/${t.id}`, { method: "DELETE" }), await reload())) }, "✕"),
+										],
+								),
+							);
+						}),
+						h("tr", {}, h("td", { colspan: 4 }, `${data.length} ${data.length === 1 ? "entry" : "entries"}${data.length === 1000 ? " (first 1000: narrow the dates)" : ""}`), h("td", { class: "n" }, hrs(total)), h("td", { colspan: 4 })),
+					),
+		);
+	}
+
+	// ---- Billable hours ---------------------------------------------------------
+	const billPeriod = { from: "", to: today() };
+
+	function downloadCsv(name, rows) {
+		const esc = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
+		const url = URL.createObjectURL(new Blob([rows.map((r) => r.map(esc).join(",")).join("\r\n")], { type: "text/csv" }));
+		h("a", { href: url, download: name }).click();
+		setTimeout(() => URL.revokeObjectURL(url), 5000);
+	}
+
+	async function openBilling(id) {
+		const b = await api(`/billings/${id}`);
+		dialog(
+			`Billed hours ${b.id} · ${b.customer_name}`,
+			h(
+				"div",
+				{},
+				h("p", {}, `${b.period_start} to ${b.period_end}, billed ${b.billing_date}: ${hrs(b.total_minutes)} h, ${money(b.total_cents)} ${b.currency} `, chip(b.status, b.status === "posted" ? "ok" : "bad")),
+				b.journal_entry_id !== null && h("p", {}, h("a", { href: `/journal/${b.journal_entry_id}`, target: "_top" }, `Journal entry ${b.journal_entry_id}`)),
+				b.lines.length
+					? table(["Date", "Employee", "Project", "What", "#Hours", "#Rate", "#Amount"], b.lines.map((t) => h("tr", {}, h("td", {}, t.work_date), h("td", {}, t.employee_name), h("td", {}, t.project_name ?? ""), h("td", {}, t.description), h("td", { class: "n" }, hrs(t.minutes)), h("td", { class: "n" }, money(t.rate_cents)), h("td", { class: "n" }, money(t.amount_cents)))))
+					: empty("Reversed: its hours are billable again."),
+				b.lines.length > 0 &&
+					h(
+						"p",
+						{},
+						h(
+							"button",
+							{
+								type: "button",
+								class: "plain",
+								onclick: () => downloadCsv(`billed-hours-${b.id}.csv`, [["Date", "Employee", "Project", "Description", "Hours", "Rate", "Amount", "Currency"], ...b.lines.map((t) => [t.work_date, t.employee_name, t.project_name ?? "", t.description, (t.minutes / 60).toFixed(2), dollars(t.rate_cents), dollars(t.amount_cents), b.currency])]),
+							},
+							"Download as CSV",
+						),
+						h("small", {}, " for the invoice you send the customer"),
+					),
+			),
+			null,
+			async () => {},
+		);
+	}
+
+	async function showBilling() {
+		const qs = new URLSearchParams({ show: "billable", ...(billPeriod.from ? { from: billPeriod.from } : {}), ...(billPeriod.to ? { to: billPeriod.to } : {}) });
+		const [{ data: open }, { data: done }] = await Promise.all([api(`/time?${qs}`), api("/billings")]);
+		const groups = new Map();
+		for (const t of open) {
+			const key = t.customer_entity_id === null ? "" : String(t.customer_entity_id);
+			if (!groups.has(key)) groups.set(key, []);
+			groups.get(key).push(t);
+		}
+		const name = (id) => st.customers.find((c) => String(c.id) === id)?.name ?? "A customer no longer in Entities";
+		const reload = () => Promise.all([showBilling(), refreshSummary()]);
+		const cards = [...groups].sort(([a], [b]) => (a === "" ? 1 : b === "" ? -1 : name(a).localeCompare(name(b)))).map(([key, list]) => {
+			const billableNow = list.filter((t) => t.rate_cents > 0);
+			const total = billableNow.reduce((a, t) => a + Number(t.amount_cents), 0);
+			const dates = list.map((t) => t.work_date).sort();
+			return h(
+				"div",
+				{ class: "card" },
+				h(
+					"h3",
+					{},
+					key === "" ? "No customer yet" : name(key),
+					key !== "" &&
+						canEdit() &&
+						h(
+							"button",
+							{
+								disabled: total <= 0,
+								onclick: () => {
+									const date = h("input", { type: "date", required: true, value: today() });
+									const ar = accountSelect({ types: ["asset"], selected: st.summary.accounts.receivable_account, defaults: { name: "Accounts receivable" } });
+									const rev = accountSelect({ types: ["revenue"], selected: st.summary.accounts.revenue_account, defaults: { name: "Service revenue" } });
+									const from = billPeriod.from || dates[0];
+									const to = billPeriod.to || dates[dates.length - 1];
+									dialog(
+										`Bill ${name(key)}`,
+										h(
+											"div",
+											{},
+											h("p", {}, `${hrs(billableNow.reduce((a, t) => a + t.minutes, 0))} h from ${from} to ${to}: ${moneyC(total)}.`),
+											h("p", { class: "muted" }, "Posts a journal entry: debit receivable, credit revenue. The hours are then marked billed."),
+											h("div", { class: "row" }, field("Billing date", date)),
+											h("div", { class: "row" }, field("Accounts receivable", ar), field("Revenue", rev)),
+										),
+										"Bill hours",
+										async () => {
+											const b = await send("POST", "/billings", { customer_entity_id: Number(key), period_start: from, period_end: to, billing_date: date.value, receivable_account: ar.value, revenue_account: rev.value });
+											await reload();
+											say(`Billed ${money(b.total_cents)} ${b.currency} to ${b.customer_name} (journal entry ${b.journal_entry_id}).`);
+										},
+									);
+								},
+							},
+							`Bill ${moneyC(total)}`,
+						),
+				),
+				key === "" && h("p", { class: "muted" }, "These hours can't be billed until their project has a customer (People tab → Projects), or the entry has a project."),
+				list.some((t) => t.rate_cents === 0n || Number(t.rate_cents) === 0) && h("p", { class: "muted" }, "Hours without a billing rate are left out: set a rate on the project, the employee or the entry."),
+				table(
+					["Date", "Employee", "Project", "What", "#Hours", "#Rate", "#Amount"],
+					list.map((t) => h("tr", {}, h("td", { style: "white-space: nowrap" }, t.work_date), h("td", {}, t.employee_name), h("td", {}, t.project_name ?? h("span", { class: "muted" }, "—")), h("td", {}, t.description), h("td", { class: "n" }, hrs(t.minutes)), h("td", { class: "n" }, Number(t.rate_cents) > 0 ? money(t.rate_cents) : chip("no rate", "warn")), h("td", { class: "n" }, money(t.amount_cents)))),
+					h("tr", {}, h("td", { colspan: 4 }), h("td", { class: "n" }, hrs(list.reduce((a, t) => a + t.minutes, 0))), h("td", {}), h("td", { class: "n" }, money(list.reduce((a, t) => a + Number(t.amount_cents), 0)))),
+				),
+			);
+		});
+		put($("main"), 
+			h("div", { class: "row" }, field("Billable hours from", h("input", { type: "date", value: billPeriod.from, onchange: (e) => ((billPeriod.from = e.target.value), showBilling().catch(fail)) })), field("To", h("input", { type: "date", value: billPeriod.to, onchange: (e) => ((billPeriod.to = e.target.value), showBilling().catch(fail)) }))),
+			cards.length ? cards : empty("No unbilled billable hours in this period. Mark time as billable on the Time tab (or in timesheet.io)."),
+			h("h2", {}, "Billed"),
+			done.length === 0
+				? empty("Nothing billed yet.")
+				: table(
+						["#No.", "Customer", "Period", "Billed", "#Hours", "#Amount", "", ""],
+						done.map((b) =>
+							h(
+								"tr",
+								{},
+								h("td", { class: "n" }, String(b.id)),
+								h("td", {}, b.customer_name),
+								h("td", {}, `${b.period_start} – ${b.period_end}`),
+								h("td", { style: "white-space: nowrap" }, b.billing_date),
+								h("td", { class: "n" }, hrs(b.total_minutes)),
+								h("td", { class: "n" }, `${money(b.total_cents)} ${b.currency}`),
+								h("td", {}, chip(b.status, b.status === "posted" ? "ok" : b.status === "reversed" ? "bad" : "warn")),
+								h(
+									"td",
+									{ style: "white-space: nowrap" },
+									h("button", { class: "plain small", onclick: act(() => openBilling(b.id)) }, "Open"),
+									" ",
+									canEdit() && b.status === "posted" && h("button", { class: "danger small", onclick: act(async () => confirm(`Reverse billing ${b.id} for ${b.customer_name}? Its journal entry is reversed and the hours become billable again.`) && (await send("POST", `/billings/${b.id}/reverse`), await reload())) }, "Reverse"),
+								),
+							),
+						),
+					),
+		);
+	}
+
+	// ---- Payroll ----------------------------------------------------------------
+	let openRun = null;
+
+	async function showPayroll() {
+		if (openRun !== null) return showRun(openRun);
+		const { data } = await api("/pay-runs");
+		const [pf, pt] = prevMonth();
+		const from = h("input", { type: "date", required: true, value: pf });
+		const to = h("input", { type: "date", required: true, value: pt });
+		const pay = h("input", { type: "date", required: true, value: today() });
+		put($("main"), 
+			canEdit() &&
+				h(
+					"form",
+					{
+						class: "card",
+						onsubmit: act(async () => {
+							const run = await send("POST", "/pay-runs", { period_start: from.value, period_end: to.value, pay_date: pay.value });
+							openRun = run.id;
+							await Promise.all([showPayroll(), refreshSummary()]);
+						}),
+					},
+					h("h3", {}, "New pay run"),
+					h("p", { class: "muted" }, "Takes every hour in the period that isn't on a pay run yet (hourly employees) plus one period's pay for each salaried employee. You review it as a draft before anything is posted."),
+					h("div", { class: "row" }, field("Hours from", from), field("To", to), field("Pay date", pay), h("button", { type: "submit" }, "Start draft")),
+				),
+			data.length === 0
+				? empty("No pay runs yet.")
+				: table(
+						["#No.", "Period", "Pay date", "#Employees", "#Gross", "#Net pay", "", ""],
+						data.map((r) =>
+							h(
+								"tr",
+								{},
+								h("td", { class: "n" }, String(r.id)),
+								h("td", {}, `${r.period_start} – ${r.period_end}`),
+								h("td", { style: "white-space: nowrap" }, r.pay_date),
+								h("td", { class: "n" }, String(r.employees)),
+								h("td", { class: "n" }, `${money(r.gross_cents)} ${r.currency}`),
+								h("td", { class: "n" }, money(r.net_cents)),
+								h("td", {}, chip(r.status, r.status === "posted" ? "ok" : r.status === "reversed" ? "bad" : "warn")),
+								h("td", {}, h("button", { class: "plain small", onclick: act(() => ((openRun = r.id), showPayroll())) }, r.status === "draft" && canEdit() ? "Review" : "Open")),
+							),
+						),
+					),
+		);
+	}
+
+	async function showRun(id) {
+		let run;
+		try {
+			run = await api(`/pay-runs/${id}`);
+		} catch (e) {
+			openRun = null;
+			await showPayroll();
+			throw e;
+		}
+		const draft = run.status === "draft" && canEdit();
+		const back = () => ((openRun = null), Promise.all([showPayroll(), refreshSummary()]));
+		const amount = (line, key) =>
+			draft
+				? h("input", {
+						class: "num",
+						inputmode: "decimal",
+						"aria-label": key,
+						value: dollars(line[key]),
+						onchange: act(async (ev) => {
+							try {
+								await send("PATCH", `/pay-runs/${id}/lines/${line.id}`, { [key]: toCents(ev.target.value) });
+							} finally {
+								await showRun(id);
+							}
+						}),
+					})
+				: money(line[key]);
+		put($("main"), 
+			h("p", {}, h("button", { class: "plain small", onclick: act(back) }, "← All pay runs")),
+			h("h2", {}, `Pay run ${run.id} · ${run.period_start} to ${run.period_end} `, chip(run.status, run.status === "posted" ? "ok" : run.status === "reversed" ? "bad" : "warn")),
+			h("p", { class: "muted" }, `Pay date ${run.pay_date} · ${run.currency}`, run.posted_by ? ` · posted by ${run.posted_by}` : "", run.paid_from_account ? ` from account ${run.paid_from_account}` : "", run.reversed_by ? ` · reversed by ${run.reversed_by}` : ""),
+			run.journal_entry_id !== null && h("p", {}, h("a", { href: `/journal/${run.journal_entry_id}`, target: "_top" }, `Journal entry ${run.journal_entry_id}`)),
+			draft && h("p", { class: "note" }, "Deductions are what you withhold from each person's pay (income tax, pension, insurance). Employer cost is your own share on top. Both start from the percentages on the employee and are yours to correct: this module doesn't calculate statutory payroll taxes."),
+			table(
+				["Employee", "#Hours", "#Rate", "#Gross", "#Deductions", "#Net pay", "#Employer cost"],
+				run.lines.map((l) => h("tr", {}, h("td", {}, l.employee_name, " ", l.pay_type === "salary" && chip("salary")), h("td", { class: "n" }, l.pay_type === "salary" ? "" : hrs(l.minutes)), h("td", { class: "n" }, money(l.rate_cents)), h("td", { class: "n" }, amount(l, "gross_cents")), h("td", { class: "n" }, amount(l, "deductions_cents")), h("td", { class: "n" }, money(l.net_cents)), h("td", { class: "n" }, amount(l, "employer_cost_cents")))),
+				h("tr", {}, h("td", { colspan: 3 }, "Total"), h("td", { class: "n" }, money(run.gross_cents)), h("td", { class: "n" }, money(run.deductions_cents)), h("td", { class: "n" }, money(run.net_cents)), h("td", { class: "n" }, money(run.employer_cost_cents))),
+			),
+			h(
+				"div",
+				{ class: "actions" },
+				draft && h("button", { class: "danger", onclick: act(async () => confirm("Delete this draft? Its hours go back to unpaid.") && (await api(`/pay-runs/${id}`, { method: "DELETE" }), await back())) }, "Delete draft"),
+				draft &&
+					h(
+						"button",
+						{
+							onclick: () => {
+								const a = st.summary.accounts;
+								const paid = accountSelect({ types: ["asset", "liability"], banksFirst: true, defaults: { name: "Chequing", type: "asset" } });
+								const wages = accountSelect({ types: ["expense"], selected: a.wages_expense_account, defaults: { name: "Wages and salaries" } });
+								const liab = accountSelect({ types: ["liability"], selected: a.payroll_liabilities_account, defaults: { name: "Payroll liabilities" } });
+								const emp = accountSelect({ types: ["expense"], selected: a.employer_cost_account, defaults: { name: "Employer payroll costs" } });
+								const needLiab = Number(run.deductions_cents) + Number(run.employer_cost_cents) > 0;
+								const needEmp = Number(run.employer_cost_cents) > 0;
+								dialog(
+									`Post pay run ${run.id}`,
+									h(
+										"div",
+										{},
+										h("p", {}, `Gross ${moneyC(run.gross_cents)}, net pay ${moneyC(run.net_cents)} to ${run.employees} ${run.employees === 1 ? "employee" : "employees"}, dated ${run.pay_date}.`),
+										h("p", { class: "muted" }, "Posts one journal entry. Posted entries can't be edited, only reversed."),
+										h("div", { class: "row" }, field("Net pay is paid from", paid, "Your bank account, or a wages payable account if you pay later.")),
+										h("div", { class: "row" }, field("Wages expense", wages), needLiab && field("Payroll liabilities", liab, "Deductions and employer's share, until you remit them.")),
+										needEmp && h("div", { class: "row" }, field("Employer payroll cost (expense)", emp)),
+									),
+									"Post pay run",
+									async () => {
+										await send("POST", `/pay-runs/${id}/post`, { paid_from_account: paid.value, wages_expense_account: wages.value, ...(needLiab ? { payroll_liabilities_account: liab.value } : {}), ...(needEmp ? { employer_cost_account: emp.value } : {}) });
+										await Promise.all([showRun(id), refreshSummary()]);
+										say(`Pay run ${id} posted.`);
+									},
+								);
+							},
+						},
+						"Post pay run…",
+					),
+				canEdit() && run.status === "posted" && h("button", { class: "danger", onclick: act(async () => confirm(`Reverse pay run ${id}? Its journal entry is reversed and its hours go back to unpaid.`) && (await send("POST", `/pay-runs/${id}/reverse`), await showRun(id), await refreshSummary())) }, "Reverse pay run"),
+			),
+		);
+	}
+
+	// ---- People: employees and projects ---------------------------------------------
+	function employeeDialog(e) {
+		const f = {
+			name: h("input", { required: true, maxlength: 200, value: e?.name ?? "" }),
+			email: h("input", { type: "email", maxlength: 200, value: e?.email ?? "" }),
+			number: h("input", { maxlength: 100, value: e?.employee_number ?? "" }),
+			type: h("select", {}, h("option", { value: "hourly" }, "Hourly"), h("option", { value: "salary" }, "Salary")),
+			pay: h("input", { class: "num", inputmode: "decimal", required: true, value: dollars(e?.pay_rate_cents ?? 0) }),
+			bill: h("input", { class: "num", inputmode: "decimal", required: true, value: dollars(e?.bill_rate_cents ?? 0) }),
+			wh: h("input", { class: "num", type: "number", min: 0, max: 100, step: "0.01", value: e?.withholding_percent ?? 0 }),
+			ec: h("input", { class: "num", type: "number", min: 0, max: 100, step: "0.01", value: e?.employer_cost_percent ?? 0 }),
+			active: h("input", { type: "checkbox", checked: e?.is_active ?? true }),
+			notes: h("textarea", { rows: 2, maxlength: 2000 }, e?.notes ?? ""),
+		};
+		f.type.value = e?.pay_type ?? "hourly";
+		const payLabel = h("span", {});
+		const relabel = () => (payLabel.textContent = f.type.value === "salary" ? `Pay per pay run (${cur()})` : `Pay per hour (${cur()})`);
+		f.type.onchange = relabel;
+		relabel();
+		dialog(
+			e ? e.name : "New employee",
+			h(
+				"div",
+				{},
+				h("div", { class: "row" }, field("Name", f.name), field("Email", f.email, "Matches the person's timesheet.io account.")),
+				h("div", { class: "row" }, field("Pay type", f.type), h("label", {}, payLabel, f.pay), field(`Billing rate per hour (${cur()})`, f.bill)),
+				h("div", { class: "row" }, field("Withheld from pay, %", f.wh, "Starting point for deductions on a pay run."), field("Employer cost, %", f.ec, "Your share on top of gross pay.")),
+				h("div", { class: "row" }, field("Employee number", f.number), h("label", { class: "check" }, f.active, "Active")),
+				h("div", { class: "row" }, field("Notes", f.notes)),
+				e?.timesheet_user_id && h("p", { class: "muted" }, "Linked to a timesheet.io account."),
+			),
+			e ? "Save" : "Add employee",
+			async () => {
+				const b = { name: f.name.value, email: f.email.value, employee_number: f.number.value, pay_type: f.type.value, pay_rate_cents: toCents(f.pay.value), bill_rate_cents: toCents(f.bill.value), withholding_percent: Number(f.wh.value) || 0, employer_cost_percent: Number(f.ec.value) || 0, is_active: f.active.checked, notes: f.notes.value };
+				await (e ? send("PATCH", `/employees/${e.id}`, b) : send("POST", "/employees", b));
+				await loadShared();
+				await showPeople();
+			},
+		);
+	}
+
+	function projectDialog(p) {
+		const name = h("input", { required: true, maxlength: 200, value: p?.name ?? "", disabled: Boolean(p?.timesheet_project_id) });
+		const cust = customerSelect(p?.customer_entity_id);
+		const rate = h("input", { class: "num", inputmode: "decimal", placeholder: "the employee's rate", value: dollars(p?.bill_rate_cents) });
+		const active = h("input", { type: "checkbox", checked: p?.is_active ?? true });
+		dialog(
+			p ? p.name : "New project",
+			h(
+				"div",
+				{},
+				h("div", { class: "row" }, field("Name", name, p?.timesheet_project_id && "Named in timesheet.io.")),
+				h("div", { class: "row" }, field("Customer billed for it", cust, p?.timesheet_client_name && `Client in timesheet.io: ${p.timesheet_client_name}`), field(`Billing rate per hour (${cur()})`, rate, "Empty: each employee's own rate.")),
+				h("div", { class: "row" }, h("label", { class: "check" }, active, "Active")),
+			),
+			p ? "Save" : "Add project",
+			async () => {
+				const b = { customer_entity_id: cust.value ? Number(cust.value) : null, bill_rate_cents: rate.value.trim() === "" ? null : toCents(rate.value), is_active: active.checked };
+				if (!p?.timesheet_project_id) b.name = name.value;
+				await (p ? send("PATCH", `/projects/${p.id}`, b) : send("POST", "/projects", b));
+				await loadShared();
+				await showPeople();
+			},
+		);
+	}
+
+	async function showPeople() {
+		const edit = (fn, x) => canEdit() && h("button", { class: "plain small", onclick: () => fn(x) }, "Edit");
+		put($("main"), 
+			h("div", { class: "top" }, h("h2", { style: "margin: 0" }, "Employees"), canEdit() && h("button", { onclick: () => employeeDialog(null) }, "Add employee")),
+			st.employees.length === 0
+				? empty("No employees yet. Add them here, import a CSV under Settings → Employees, or sync timesheet.io to add everyone who tracked time.")
+				: table(
+						["Name", "Pay", "#Pay rate", "#Billing rate", "#Withheld", "#Employer", "", ""],
+						st.employees.map((e) =>
+							h(
+								"tr",
+								{},
+								h("td", {}, e.name, e.email && h("div", {}, h("small", {}, e.email))),
+								h("td", {}, e.pay_type),
+								h("td", { class: "n" }, Number(e.pay_rate_cents) > 0 ? `${money(e.pay_rate_cents)}${e.pay_type === "hourly" ? " /h" : " /run"}` : chip("set a rate", "warn")),
+								h("td", { class: "n" }, `${money(e.bill_rate_cents)} /h`),
+								h("td", { class: "n" }, `${e.withholding_percent}%`),
+								h("td", { class: "n" }, `${e.employer_cost_percent}%`),
+								h("td", {}, !e.is_active && chip("inactive"), e.timesheet_user_id && chip("timesheet.io")),
+								h("td", {}, edit(employeeDialog, e)),
+							),
+						),
+					),
+			h("div", { class: "top", style: "margin-top: 1.5rem" }, h("h2", { style: "margin: 0" }, "Projects"), canEdit() && h("button", { class: "plain", onclick: () => projectDialog(null) }, "Add project")),
+			h("p", { class: "muted" }, "A project says which customer its billable hours are billed to. Customers are Ledger's shared Entities."),
+			st.projects.length === 0
+				? empty("No projects yet.")
+				: table(
+						["Project", "Customer", "#Billing rate", "", ""],
+						st.projects.map((p) => h("tr", {}, h("td", {}, p.name), h("td", {}, p.customer_name ?? chip("choose a customer", "warn"), !p.customer_name && p.timesheet_client_name ? h("div", {}, h("small", {}, `timesheet.io client: ${p.timesheet_client_name}`)) : null), h("td", { class: "n" }, p.bill_rate_cents === null ? h("span", { class: "muted" }, "employee's") : `${money(p.bill_rate_cents)} /h`), h("td", {}, !p.is_active && chip("inactive"), p.timesheet_project_id && chip("timesheet.io")), h("td", {}, edit(projectDialog, p)))),
+					),
+		);
+	}
+
+	// ---- timesheet.io ---------------------------------------------------------------
+	async function showTimesheet() {
+		const s = await api("/timesheet/status");
+		const last = s.last_sync;
+		put($("main"), 
+			h("p", {}, "Pulls the time your team tracks in timesheet.io into Ledger: each finished task becomes a time entry, with its person, project and whether it is billable."),
+			s.configured
+				? h(
+						"div",
+						{ class: "card" },
+						h("h3", {}, "Connected with an API key", chip(s.auto_sync ? "syncs every hour" : "syncs when you press Sync", s.auto_sync ? "ok" : "")),
+						h("p", { class: "muted" }, `Each sync reads the last ${s.days} days. Time already billed or on a pay run is never changed by a sync.`),
+						last && h("p", {}, h("b", {}, last.succeeded === false ? "Last sync failed: " : last.succeeded === null ? "Sync started: " : "Last sync: "), `${new Date(last.started_at).toLocaleString()} by ${last.started_by}. ${last.summary}`),
+						canEdit() &&
+							h(
+								"div",
+								{ class: "actions", style: "justify-content: flex-start" },
+								h("button", { onclick: act(syncNow) }, "Sync now"),
+								h("button", { class: "plain", onclick: act(async () => say(`timesheet.io answered: ${(await send("POST", "/timesheet/test")).account}`)) }, "Test the connection"),
+							),
+					)
+				: h(
+						"div",
+						{ class: "card" },
+						h("h3", {}, "Not connected yet"),
+						h("ol", {}, h("li", {}, "In timesheet.io, open ", h("a", { href: "https://my.timesheet.io/development/apikeys", target: "_blank", rel: "noopener" }, "my.timesheet.io → Development → API keys"), " and create a key."), h("li", {}, "In Ledger, an admin pastes it under Settings → Employees → timesheet.io API key."), h("li", {}, "Come back here and press Sync now.")),
+					),
+			h("h2", {}, "How it maps"),
+			h(
+				"ul",
+				{},
+				h("li", {}, "People: matched to an employee by email, or added as a new employee with no pay rate (set it on the People tab)."),
+				h("li", {}, "Projects: added with their hourly rate. Their client is matched to a customer in Entities when the name is the same; otherwise choose the customer on the People tab."),
+				h("li", {}, "Hours: the task's length minus its breaks, on the day it started. Running timers, mileage and calls are left out."),
+				h("li", {}, "Edits and deletions in timesheet.io are picked up by the next sync, except for time already billed or paid here."),
+			),
+		);
+	}
+
+	// ---- tabs -----------------------------------------------------------------------
+	const TABS = [
+		["time", "Time", showTime],
+		["billing", "Billable hours", showBilling],
+		["payroll", "Payroll", showPayroll],
+		["people", "People", showPeople],
+		["timesheet", "timesheet.io", showTimesheet],
+	];
+	async function show(tab) {
+		st.tab = tab;
+		$("tabs").replaceChildren(...TABS.map(([id, label]) => h("button", { role: "tab", "aria-selected": String(id === tab), onclick: () => show(id).catch(fail) }, label)));
+		await TABS.find(([id]) => id === tab)[2]();
+	}
+
+	(async () => {
+		await loadShared();
+		const p = new URLSearchParams(location.search);
+		if (p.get("payrun") && /^\d+$/.test(p.get("payrun"))) {
+			openRun = Number(p.get("payrun"));
+			await show("payroll");
+		} else if (p.get("billing") && /^\d+$/.test(p.get("billing"))) {
+			await show("billing");
+			await openBilling(p.get("billing"));
+		} else if (p.get("employee")) {
+			await show("people");
+			const e = st.employees.find((x) => String(x.id) === p.get("employee"));
+			if (e && canEdit()) employeeDialog(e);
+		} else await show(TABS.some(([id]) => id === p.get("tab")) ? p.get("tab") : "time");
+	})().catch(fail);
+</script>
+</body>
+</html>

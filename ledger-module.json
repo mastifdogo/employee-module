@@ -1,0 +1,29 @@
+{
+  "id": "employees",
+  "name": "Employees",
+  "version": "1.0.0",
+  "description": "Track employee time, bill customers for billable hours and run payroll, with time pulled from timesheet.io.",
+  "ledger": ">=0.16.0",
+  "server": "server.mjs",
+  "ui": "ui",
+  "nav": {
+    "label": "Employees",
+    "icon": {
+      "path": "M9 11a3.5 3.5 0 1 0 0-7a3.5 3.5 0 0 0 0 7z M2.5 20c0-3.6 2.9-6 6.5-6c1.2 0 2.3.3 3.3.8 M17 13a4.5 4.5 0 1 0 0 9a4.5 4.5 0 0 0 0-9z M17 15.5v2l1.4 1"
+    }
+  },
+  "migrations": "migrations",
+  "settings": {
+    "fields": [
+      { "key": "currency", "label": "Currency", "type": "select", "options": ["CAD", "USD"], "default": "CAD", "help": "Pay rates, billing rates, billings and pay runs are all in this currency." },
+      { "key": "wages_expense_account", "label": "Wages expense account code", "type": "text", "help": "Debited with gross pay when a pay run is posted. Can also be chosen when posting." },
+      { "key": "employer_cost_account", "label": "Employer payroll cost account code", "type": "text", "help": "Expense account for the employer's share (pension, insurance, payroll taxes)." },
+      { "key": "payroll_liabilities_account", "label": "Payroll liabilities account code", "type": "text", "help": "Liability account credited with amounts withheld from pay plus the employer's share, until they are remitted." },
+      { "key": "receivable_account", "label": "Accounts receivable account code", "type": "text", "help": "Debited when billable hours are billed to a customer." },
+      { "key": "revenue_account", "label": "Revenue account code for billed hours", "type": "text", "help": "Credited when billable hours are billed to a customer." },
+      { "key": "timesheet_api_key", "label": "timesheet.io API key", "type": "secret", "help": "Create one at my.timesheet.io → Development → API keys. It looks like ts_xxxx.yyyy." },
+      { "key": "timesheet_sync_days", "label": "Days of time to pull from timesheet.io", "type": "number", "min": 1, "max": 730, "default": 60, "help": "Each sync re-reads this many days back, so edits made in timesheet.io are picked up." },
+      { "key": "timesheet_auto_sync", "label": "Pull from timesheet.io every hour", "type": "boolean", "default": false }
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "ledger-employees-module",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "sh test/run.sh" }
+}
