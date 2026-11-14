@@ -727,7 +727,7 @@ export default async function register(ctx) {
 
 	ctx.route("GET", "/timesheet/status", async () => {
 		const s = await ctx.settings.get();
-		return { configured: Boolean(s.timesheet_api_key), auto_sync: s.timesheet_auto_sync === true, days: s.timesheet_sync_days ?? 60, last_sync: await lastSync() };
+		return { configured: Boolean(s.timesheet_api_key), auto_sync: s.timesheet_auto_sync === true, on_sign_in: s.timesheet_sync_on_login !== false, days: s.timesheet_sync_days ?? 60, last_sync: await lastSync() };
 	});
 
 	ctx.route("POST", "/timesheet/test", async () => {
@@ -849,21 +849,46 @@ export default async function register(ctx) {
 		},
 	});
 
-	// Hourly pull from timesheet.io, in every organization that turned it on.
-	setInterval(() => {
+	/** A pull nobody pressed a button for, in the organizations wanted(org, settings) picks; a failure goes to the dashboard. */
+	const pullInBackground = (who, wanted) =>
 		ctx.orgs
 			.forEach(async (org) => {
 				const s = await ctx.settings.get();
-				if (s.timesheet_auto_sync !== true || !s.timesheet_api_key) return;
+				if (!s.timesheet_api_key || !wanted(org, s)) return;
 				try {
-					await sync(s, "timesheet.io (hourly)", org.id);
+					await sync(s, who, org.id);
 					await ctx.dashboard.dismiss("timesheet-sync");
 				} catch (e) {
-					await ctx.dashboard.notify({ key: "timesheet-sync", title: "The hourly timesheet.io sync failed", body: String(e?.message ?? e).slice(0, 500), level: "warning", link: "/settings/m/employees" });
+					if (e instanceof TimesheetError && e.message === "A sync is already running.") return;
+					await ctx.dashboard.notify({ key: "timesheet-sync", title: "Pulling hours from timesheet.io failed", body: String(e?.message ?? e).slice(0, 500), level: "warning", link: "/settings/m/employees" });
 				}
 			})
 			.catch((e) => ctx.log.warn("timesheet.io sync failed", { error: String(e?.message ?? e) }));
-	}, 3_600_000).unref();
+
+	// Hourly pull from timesheet.io, in every organization that turned it on.
+	setInterval(() => pullInBackground("timesheet.io (hourly)", (_org, s) => s.timesheet_auto_sync === true), 3_600_000).unref();
+
+	// Pull when someone signs in. Modules get no sign-in event, so this watches for new
+	// sessions in Ledger's own table (only when they were created and for which organization).
+	let signInsSince = new Date();
+	let watchSignIns = true;
+	setInterval(async () => {
+		if (!watchSignIns) return;
+		try {
+			const { rows } = await q(
+				`SELECT COALESCE((to_jsonb(s)->>'org_id')::int, 1) AS org_id, max(date_trunc('milliseconds', s.created_at)) AS at
+				FROM public.sessions s WHERE date_trunc('milliseconds', s.created_at) > $1 GROUP BY 1`,
+				[signInsSince],
+			);
+			if (rows.length === 0) return;
+			for (const r of rows) if (r.at > signInsSince) signInsSince = r.at;
+			const orgs = new Set(rows.map((r) => Number(r.org_id)));
+			await pullInBackground("timesheet.io (on sign-in)", (org, s) => orgs.has(Number(org.id)) && s.timesheet_sync_on_login !== false);
+		} catch (e) {
+			watchSignIns = false;
+			ctx.log.warn("can't see sign-ins: timesheet.io won't be pulled on sign-in", { error: String(e?.message ?? e) });
+		}
+	}, Number(process.env.EMPLOYEES_SIGN_IN_POLL_MS) || 15_000).unref();
 
 	ctx.log.info("employees module ready");
 }

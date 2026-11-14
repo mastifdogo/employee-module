@@ -84,7 +84,7 @@
 				? h(
 						"div",
 						{ class: "card" },
-						h("h3", {}, "Connected with an API key", h("span", { class: `chip ${s.auto_sync ? "ok" : ""}` }, s.auto_sync ? "syncs every hour" : "syncs when you press Sync")),
+						h("h3", {}, "Connected with an API key", h("span", { class: `chip ${s.auto_sync ? "ok" : ""}` }, [s.on_sign_in && "pulls on sign-in", s.auto_sync && "pulls every hour"].filter(Boolean).join(" · ") || "pulls when you press Pull hours")),
 						h("p", { class: "muted" }, `Each sync reads the last ${s.days} days. Time already billed or on a pay run is never changed by a sync.`),
 						last && h("p", {}, h("b", {}, last.succeeded === false ? "Last sync failed: " : last.succeeded === null ? "Sync started: " : "Last sync: "), `${new Date(last.started_at).toLocaleString()} by ${last.started_by}. ${last.summary}`),
 						canEdit &&
@@ -101,7 +101,7 @@
 											say(r.summary);
 										}),
 									},
-									"Sync now",
+									"Pull hours now",
 								),
 								h("button", { class: "plain", onclick: act(async () => say(`timesheet.io answered: ${(await post("/timesheet/test")).account}`)) }, "Test the connection"),
 							),
@@ -115,7 +115,7 @@
 							{},
 							h("li", {}, "In timesheet.io, open ", h("a", { href: "https://my.timesheet.io/development/apikeys", target: "_blank", rel: "noopener" }, "my.timesheet.io → Development → API keys"), " and create a key."),
 							h("li", {}, "Paste it in “timesheet.io API key” above and save."),
-							h("li", {}, "Press Sync now here, or turn on the hourly pull above."),
+							h("li", {}, "Hours are then pulled each time someone signs in to Ledger, and with Pull hours on the Employees page."),
 						),
 					),
 			h("h3", {}, "How it maps"),

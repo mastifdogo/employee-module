@@ -16,7 +16,8 @@
 	p { margin: 0.4rem 0; }
 	.top { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center; justify-content: space-between; }
 	.tiles { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.9rem 0; }
-	.tile { flex: 1 1 8.5rem; border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.7rem; }
+	.tile { flex: 1 1 6.5rem; min-width: 0; border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.7rem; }
+	.tiles > button { flex: 0 0 auto; padding: 0.5rem 1.1rem; font-weight: 600; }
 	.tile b { display: block; font-size: 1.15rem; font-variant-numeric: tabular-nums; }
 	.tile span, .muted, small { color: var(--muted); }
 	small { font-size: 0.82rem; }
@@ -85,10 +86,7 @@
 </style>
 </head>
 <body>
-<div class="top">
-	<h1>Employees</h1>
-	<button id="syncTop" class="plain" hidden>Sync timesheet.io</button>
-</div>
+<h1>Employees</h1>
 <div class="tiles" id="tiles"></div>
 <div id="msg"></div>
 <nav id="tabs" role="tablist"></nav>
@@ -289,17 +287,15 @@
 	function drawTiles() {
 		const s = st.summary;
 		const tile = (value, label) => h("div", { class: "tile" }, h("b", {}, value), h("span", {}, label));
-		$("tiles").replaceChildren(tile(String(s.employees), "active employees"), tile(`${hrs(s.unpaid_minutes)} h`, "not on a pay run yet"), tile(`${hrs(s.unbilled_minutes)} h`, "billable, not billed"), tile(moneyC(s.unbilled_cents), "to bill"));
-		$("syncTop").hidden = !(s.timesheet.configured && canEdit());
+		put($("tiles"), tile(String(s.employees), "active employees"), tile(`${hrs(s.unpaid_minutes)} h`, "not on a pay run yet"), tile(`${hrs(s.unbilled_minutes)} h`, "billable, not billed"), tile(moneyC(s.unbilled_cents), "to bill"), canEdit() && h("button", { title: "Pull the latest hours from timesheet.io", onclick: act(syncNow) }, "Pull hours"));
 	}
 	async function syncNow() {
-		say("Reading time from timesheet.io…");
+		say("Pulling hours from timesheet.io…");
 		const r = await send("POST", "/timesheet/sync");
 		await loadShared();
 		await show(st.tab);
 		say(r.summary);
 	}
-	$("syncTop").onclick = act(syncNow);
 
 	// ---- Time -----------------------------------------------------------------
 	const timeFilter = { from: monthStart(), to: "", employee_id: "", show: "" };
