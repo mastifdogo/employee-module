@@ -51,7 +51,7 @@ every pay run. Use your payroll provider's or tax authority's figures.
 3. Hours are then pulled:
    - each time someone signs in to Ledger (a setting, on by default; it runs
      within about 15 seconds of the sign-in, for the organization signed in to);
-   - with the **Pull hours** button at the top of the Employees page;
+   - with the **Sync** button beside the title of the Employees page;
    - every hour, if you turn that setting on.
 
    Connection status, the last pull and *Test the connection* are on the
