@@ -842,7 +842,7 @@ export default async function register(ctx) {
 					await sync(s, "timesheet.io (hourly)", org.id);
 					await ctx.dashboard.dismiss("timesheet-sync");
 				} catch (e) {
-					await ctx.dashboard.notify({ key: "timesheet-sync", title: "The hourly timesheet.io sync failed", body: String(e?.message ?? e).slice(0, 500), level: "warning", link: "/apps/employees?tab=timesheet" });
+					await ctx.dashboard.notify({ key: "timesheet-sync", title: "The hourly timesheet.io sync failed", body: String(e?.message ?? e).slice(0, 500), level: "warning", link: "/settings/m/employees" });
 				}
 			})
 			.catch((e) => ctx.log.warn("timesheet.io sync failed", { error: String(e?.message ?? e) }));

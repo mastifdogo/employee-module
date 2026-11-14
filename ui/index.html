@@ -353,7 +353,7 @@
 					),
 			),
 			data.length === 0
-				? empty(st.summary.timesheet.configured ? "No time in this period. Add some, or sync timesheet.io." : "No time in this period. Add some here, or connect timesheet.io on its tab to pull it in.")
+				? empty(st.summary.timesheet.configured ? "No time in this period. Add some, or sync timesheet.io." : "No time in this period. Add some here, or connect timesheet.io under Settings → Employees to pull it in.")
 				: table(
 						["Date", "Employee", "Project", "What", "#Hours", "#Rate", "#Amount", "", ""],
 						data.map((t) => {
@@ -768,52 +768,12 @@
 		);
 	}
 
-	// ---- timesheet.io ---------------------------------------------------------------
-	async function showTimesheet() {
-		const s = await api("/timesheet/status");
-		const last = s.last_sync;
-		put($("main"), 
-			h("p", {}, "Pulls the time your team tracks in timesheet.io into Ledger: each finished task becomes a time entry, with its person, project and whether it is billable."),
-			s.configured
-				? h(
-						"div",
-						{ class: "card" },
-						h("h3", {}, "Connected with an API key", chip(s.auto_sync ? "syncs every hour" : "syncs when you press Sync", s.auto_sync ? "ok" : "")),
-						h("p", { class: "muted" }, `Each sync reads the last ${s.days} days. Time already billed or on a pay run is never changed by a sync.`),
-						last && h("p", {}, h("b", {}, last.succeeded === false ? "Last sync failed: " : last.succeeded === null ? "Sync started: " : "Last sync: "), `${new Date(last.started_at).toLocaleString()} by ${last.started_by}. ${last.summary}`),
-						canEdit() &&
-							h(
-								"div",
-								{ class: "actions", style: "justify-content: flex-start" },
-								h("button", { onclick: act(syncNow) }, "Sync now"),
-								h("button", { class: "plain", onclick: act(async () => say(`timesheet.io answered: ${(await send("POST", "/timesheet/test")).account}`)) }, "Test the connection"),
-							),
-					)
-				: h(
-						"div",
-						{ class: "card" },
-						h("h3", {}, "Not connected yet"),
-						h("ol", {}, h("li", {}, "In timesheet.io, open ", h("a", { href: "https://my.timesheet.io/development/apikeys", target: "_blank", rel: "noopener" }, "my.timesheet.io → Development → API keys"), " and create a key."), h("li", {}, "In Ledger, an admin pastes it under Settings → Employees → timesheet.io API key."), h("li", {}, "Come back here and press Sync now.")),
-					),
-			h("h2", {}, "How it maps"),
-			h(
-				"ul",
-				{},
-				h("li", {}, "People: matched to an employee by email, or added as a new employee with no pay rate (set it on the People tab)."),
-				h("li", {}, "Projects: added with their hourly rate. Their client is matched to a customer in Entities when the name is the same; otherwise choose the customer on the People tab."),
-				h("li", {}, "Hours: the task's length minus its breaks, on the day it started. Running timers, mileage and calls are left out."),
-				h("li", {}, "Edits and deletions in timesheet.io are picked up by the next sync, except for time already billed or paid here."),
-			),
-		);
-	}
-
 	// ---- tabs -----------------------------------------------------------------------
 	const TABS = [
 		["time", "Time", showTime],
 		["billing", "Billable hours", showBilling],
 		["payroll", "Payroll", showPayroll],
 		["people", "People", showPeople],
-		["timesheet", "timesheet.io", showTimesheet],
 	];
 	async function show(tab) {
 		st.tab = tab;

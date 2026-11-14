@@ -1,7 +1,7 @@
 {
   "id": "employees",
   "name": "Employees",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "Track employee time, bill customers for billable hours and run payroll, with time pulled from timesheet.io.",
   "ledger": ">=0.16.0",
   "server": "server.mjs",
@@ -14,6 +14,7 @@
   },
   "migrations": "migrations",
   "settings": {
+    "page": "settings.html",
     "fields": [
       { "key": "currency", "label": "Currency", "type": "select", "options": ["CAD", "USD"], "default": "CAD", "help": "Pay rates, billing rates, billings and pay runs are all in this currency." },
       { "key": "wages_expense_account", "label": "Wages expense account code", "type": "text", "help": "Debited with gross pay when a pay run is posted. Can also be chosen when posting." },

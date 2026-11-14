@@ -45,8 +45,10 @@ every pay run. Use your payroll provider's or tax authority's figures.
    (`ts_xxxx.yyyy`).
 2. In Ledger, an admin pastes it under **Settings → Employees → timesheet.io
    API key**. It is stored as a secret and never shown again.
-3. On the module's **timesheet.io** tab press **Sync now** (or turn on *Pull
-   from timesheet.io every hour* in the settings).
+3. On the same settings page, below the form, press **Sync now** (or turn on
+   *Pull from timesheet.io every hour*). Connection status, the last sync and
+   *Test the connection* are there too; the module's own page only has a
+   *Sync timesheet.io* button once a key is saved.
 
 A sync reads the tasks of the last 60 days (a setting) and:
 

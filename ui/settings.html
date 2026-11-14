@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>timesheet.io</title>
+<style>
+	:root { --bg: #fff; --soft: #f5f7f9; --text: #1d232b; --muted: #5d6875; --border: #dde1e6; --accent: #1f6feb; --danger: #cf222e; --ok: #1a7f37; --warn: #9a6700; color-scheme: light; }
+	@media (prefers-color-scheme: dark) {
+		:root { --bg: #171b21; --soft: #1e242c; --text: #e3e7ec; --muted: #97a1ad; --border: #2c333c; --accent: #4c8dff; --danger: #ff7b72; --ok: #56d364; --warn: #e3b341; color-scheme: dark; }
+	}
+	* { box-sizing: border-box; }
+	body { margin: 0; padding: 0.9rem 1rem 1.5rem; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
+	h1 { font-size: 1.4rem; margin: 0; }
+	h2 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem; }
+	p { margin: 0.4rem 0; }
+	.top { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center; justify-content: space-between; }
+	small { font-size: 0.82rem; }
+	button { padding: 0.4rem 0.8rem; border: 1px solid var(--accent); border-radius: 6px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+	button.plain { background: transparent; color: var(--accent); border-color: var(--border); }
+	button.danger { background: transparent; color: var(--danger); border-color: var(--border); }
+	button.small { padding: 0.15rem 0.5rem; font-size: 0.85rem; }
+	button:disabled { opacity: 0.55; cursor: default; }
+	.chip { display: inline-block; padding: 0 0.45rem; border: 1px solid var(--border); border-radius: 999px; font-size: 0.75rem; color: var(--muted); white-space: nowrap; }
+	.chip.ok { color: var(--ok); } .chip.warn { color: var(--warn); } .chip.bad { color: var(--danger); }
+	.card { border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem 0.9rem; margin: 0.75rem 0; }
+	.card > h3 { margin: 0 0 0.3rem; font-size: 1rem; display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: space-between; align-items: center; }
+	.note { background: var(--soft); border-radius: 6px; padding: 0.55rem 0.75rem; margin: 0.6rem 0; }
+	#msg { position: sticky; top: 0; z-index: 2; }
+	#msg div { padding: 0.5rem 0.75rem; border-radius: 6px; margin-bottom: 0.6rem; background: var(--soft); border: 1px solid var(--border); }
+	.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; }
+	a { color: var(--accent); }
+	[hidden] { display: none !important; }
+	ol, ul { margin: 0.4rem 0; padding-left: 1.3rem; }
+	#msg .error { color: var(--danger); border-color: var(--danger); }
+</style>
+</head>
+<body>
+<h2 style="margin-top: 0">timesheet.io</h2>
+<div id="msg"></div>
+<main id="main"></main>
+
+<script>
+	"use strict";
+	// Shown by Ledger under Settings → Employees, below the settings form.
+	const api = (path, opts = {}) =>
+		fetch(`/api/v1/m/employees${path}`, { ...opts, headers: { "Content-Type": "application/json", ...(opts.headers || {}) } }).then(async (r) => {
+			if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error?.message || r.statusText);
+			return r.status === 204 ? null : r.json();
+		});
+	const post = (path) => api(path, { method: "POST", body: "{}" });
+	function h(tag, props, ...kids) {
+		const el = document.createElement(tag);
+		for (const [k, v] of Object.entries(props || {})) {
+			if (v === undefined || v === null || v === false) continue;
+			if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+			else if (k === "class") el.className = v;
+			else el.setAttribute(k, v);
+		}
+		el.append(...kids.flat(Infinity).filter((c) => c !== null && c !== undefined && c !== false));
+		return el;
+	}
+	const $ = (id) => document.getElementById(id);
+	const say = (text, error = false) => $("msg").replaceChildren(text ? h("div", { class: error ? "error" : "", role: error ? "alert" : "status" }, text) : "");
+	const act = (fn) => async (ev) => {
+		const btn = ev.currentTarget;
+		btn.disabled = true;
+		try {
+			await fn();
+		} catch (e) {
+			say(e.message || String(e), true);
+		} finally {
+			btn.disabled = false;
+		}
+	};
+
+	async function draw() {
+		const [s, summary] = await Promise.all([api("/timesheet/status"), api("/summary")]);
+		const canEdit = summary.role !== "viewer";
+		const last = s.last_sync;
+		$("main").replaceChildren(
+			h("p", {}, "Pulls the time your team tracks in timesheet.io into Ledger: each finished task becomes a time entry, with its person, project and whether it is billable."),
+			s.configured
+				? h(
+						"div",
+						{ class: "card" },
+						h("h3", {}, "Connected with an API key", h("span", { class: `chip ${s.auto_sync ? "ok" : ""}` }, s.auto_sync ? "syncs every hour" : "syncs when you press Sync")),
+						h("p", { class: "muted" }, `Each sync reads the last ${s.days} days. Time already billed or on a pay run is never changed by a sync.`),
+						last && h("p", {}, h("b", {}, last.succeeded === false ? "Last sync failed: " : last.succeeded === null ? "Sync started: " : "Last sync: "), `${new Date(last.started_at).toLocaleString()} by ${last.started_by}. ${last.summary}`),
+						canEdit &&
+							h(
+								"div",
+								{ class: "actions", style: "justify-content: flex-start" },
+								h(
+									"button",
+									{
+										onclick: act(async () => {
+											say("Reading time from timesheet.io…");
+											const r = await post("/timesheet/sync");
+											await draw();
+											say(r.summary);
+										}),
+									},
+									"Sync now",
+								),
+								h("button", { class: "plain", onclick: act(async () => say(`timesheet.io answered: ${(await post("/timesheet/test")).account}`)) }, "Test the connection"),
+							),
+					)
+				: h(
+						"div",
+						{ class: "card" },
+						h("h3", {}, "Not connected yet"),
+						h(
+							"ol",
+							{},
+							h("li", {}, "In timesheet.io, open ", h("a", { href: "https://my.timesheet.io/development/apikeys", target: "_blank", rel: "noopener" }, "my.timesheet.io → Development → API keys"), " and create a key."),
+							h("li", {}, "Paste it in “timesheet.io API key” above and save."),
+							h("li", {}, "Press Sync now here, or turn on the hourly pull above."),
+						),
+					),
+			h("h3", {}, "How it maps"),
+			h(
+				"ul",
+				{},
+				h("li", {}, "People: matched to an employee by email, or added as a new employee with no pay rate (set it on the module's People tab)."),
+				h("li", {}, "Projects: added with their hourly rate. Their client is matched to a customer in Entities when the name is the same; otherwise choose the customer on the People tab."),
+				h("li", {}, "Hours: the task's length minus its breaks, on the day it started. Running timers, mileage and calls are left out."),
+				h("li", {}, "Edits and deletions in timesheet.io are picked up by the next sync, except for time already billed or paid here."),
+			),
+		);
+	}
+	draw().catch((e) => say(e.message || String(e), true));
+	// The key is saved with the form above this page: look again when the user comes back to it.
+	addEventListener("focus", () => draw().catch(() => {}));
+</script>
+</body>
+</html>
