@@ -62,6 +62,9 @@ const t2 = (await ok(m("GET", `/time?from=${day(3)}`))).data.find((t) => t.descr
 assert.equal(t2.minutes, 420); // 8 h minus a 1 h break
 await ok(m("PATCH", `/time/${t2.id}`, { minutes: 5 }), 409);
 await ok(m("DELETE", `/time/${t2.id}`), 409);
+const calDays = (await ok(m("GET", `/calendar?from=${day(3)}&to=${day(3)}`))).data;
+assert.deepEqual(calDays.map((r) => [r.employee_name, r.minutes, r.billable_minutes]), [["Ana S.", 180, 180]]);
+await ok(m("GET", "/calendar?from=2020-01-01&to=2026-01-01"), 422);
 step("timesheet.io sync (2 pages, idempotent, matches people by email)");
 
 // Billing

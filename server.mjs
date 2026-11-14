@@ -218,6 +218,23 @@ export default async function register(ctx) {
 		return { data: rows };
 	});
 
+	// Hours per day and employee, for the calendar.
+	ctx.route("GET", "/calendar", async (req) => {
+		const from = req.query.get("from") ? reqDate(req.query.get("from"), "from") : daysAgo(31);
+		const to = req.query.get("to") ? reqDate(req.query.get("to"), "to") : today();
+		if (to < from || Date.parse(to) - Date.parse(from) > 800 * 86_400_000) throw bad("choose up to 800 days, from before to");
+		const params = [from, to];
+		if (req.query.get("employee_id")) params.push(idOf(req.query.get("employee_id"), "employee"));
+		const { rows } = await q(
+			`SELECT t.work_date, t.employee_id, e.name AS employee_name, sum(t.minutes)::int AS minutes, COALESCE(sum(t.minutes) FILTER (WHERE t.billable), 0)::int AS billable_minutes
+			FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id
+			WHERE t.work_date BETWEEN $1 AND $2 ${params.length === 3 ? "AND t.employee_id = $3" : ""}
+			GROUP BY t.work_date, t.employee_id, e.name ORDER BY t.work_date, sum(t.minutes) DESC, e.name`,
+			params,
+		);
+		return { data: rows };
+	});
+
 	async function timeFields(b, partial) {
 		const f = {};
 		if (!partial || b.employee_id !== undefined) {

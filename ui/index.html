@@ -54,6 +54,33 @@
 	dialog .row { align-items: start; }
 	.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; }
 	a { color: var(--accent); }
+	.cal-head { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; justify-content: space-between; margin-bottom: 0.5rem; }
+	.cal-head h2 { margin: 0; font-size: 1.2rem; }
+	.cal-head label { flex: 0 1 12rem; }
+	.cal-head .row { flex-wrap: nowrap; margin: 0; }
+	.cal-head .row button { flex: 0 0 auto; }
+	.cal-wrap { --rowh: 5.6rem; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+	.dow, .week { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+	.dow { border-bottom: 1px solid var(--border); background: var(--soft); font-size: 0.72rem; text-transform: uppercase; color: var(--muted); }
+	.dow span { padding: 0.25rem 0.4rem; overflow: hidden; }
+	.cal { height: calc(6 * var(--rowh)); max-height: max(12rem, calc(100vh - 4rem)); overflow-y: auto; overscroll-behavior: contain; scroll-snap-type: y proximity; position: relative; }
+	.week { height: var(--rowh); }
+	.week.first { scroll-snap-align: start; }
+	button.day { display: flex; flex-direction: column; gap: 0.05rem; align-items: stretch; min-width: 0; overflow: hidden; padding: 0.25rem 0.4rem; border: 0; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); border-radius: 0; background: none; color: var(--text); text-align: left; font-size: 0.8rem; line-height: 1.25; }
+	button.day:nth-child(7) { border-right: 0; }
+	button.day:hover, button.day:focus-visible { background: var(--soft); }
+	button.day.out { color: var(--muted); background: var(--soft); }
+	button.day .num { font-size: 0.85rem; white-space: nowrap; }
+	button.day b { white-space: nowrap; }
+	button.day.today .num { color: var(--accent); font-weight: 700; }
+	button.day b { font-size: 0.95rem; font-variant-numeric: tabular-nums; }
+	button.day small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 0.74rem; }
+	@media (max-width: 560px) {
+		.cal-wrap { --rowh: 3.5rem; }
+		button.day { padding: 0.2rem 0.25rem; }
+		button.day small, button.day b span { display: none; }
+		button.day b { font-size: 0.8rem; }
+	}
 	[hidden] { display: none !important; }
 </style>
 </head>
@@ -768,9 +795,144 @@
 		);
 	}
 
+	// ---- Calendar: one month in view; scroll up or down for other months ---------------
+	const cal = { employee_id: "", days: new Map(), start: null, end: null, busy: false };
+	const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+	const monthName = new Intl.DateTimeFormat(undefined, { month: "long", year: "numeric" });
+	const shortMonth = new Intl.DateTimeFormat(undefined, { month: "short" });
+
+	async function calLoad(from, to) {
+		const { data } = await api(`/calendar?from=${iso(from)}&to=${iso(to)}${cal.employee_id ? `&employee_id=${cal.employee_id}` : ""}`);
+		for (const r of data) {
+			if (!cal.days.has(r.work_date)) cal.days.set(r.work_date, []);
+			cal.days.get(r.work_date).push(r);
+		}
+	}
+
+	/** The week rows from a Sunday to a Saturday. */
+	function calWeeks(from, to) {
+		const rows = [];
+		const now = today();
+		for (let d = from; d <= to; d = addDays(d, 7)) {
+			const cells = [];
+			let first = false;
+			for (let i = 0; i < 7; i++) {
+				const day = addDays(d, i);
+				const key = iso(day);
+				const list = cal.days.get(key) || [];
+				const total = list.reduce((a, r) => a + r.minutes, 0);
+				const billable = list.reduce((a, r) => a + r.billable_minutes, 0);
+				if (day.getDate() === 1) first = true;
+				cells.push(
+					h(
+						"button",
+						{
+							class: `day${key === now ? " today" : ""}`,
+							"data-month": key.slice(0, 7),
+							title: total ? `${key}: ${hrs(total)} h${billable ? `, ${hrs(billable)} h billable` : ""}. Open this day on the Time tab.` : `${key}: open this day on the Time tab.`,
+							onclick: () => {
+								Object.assign(timeFilter, { from: key, to: key, employee_id: cal.employee_id, show: "" });
+								show("time").catch(fail);
+							},
+						},
+						h("span", { class: "num" }, day.getDate() === 1 ? `${shortMonth.format(day)} 1` : String(day.getDate())),
+						total > 0 && h("b", {}, hrs(total), h("span", {}, " h")),
+						list.length > 1 || (list.length === 1 && !cal.employee_id) ? list.slice(0, 2).map((r) => h("small", {}, `${r.employee_name} ${hrs(r.minutes)}`)) : null,
+						list.length > 2 && h("small", {}, `+${list.length - 2} more`),
+					),
+				);
+			}
+			rows.push(h("div", { class: `week${first ? " first" : ""}`, "data-last": iso(addDays(d, 6)).slice(0, 7) }, cells));
+		}
+		return rows;
+	}
+
+	async function showCalendar(focus = new Date()) {
+		const sunday = (d) => addDays(d, -d.getDay());
+		cal.days = new Map();
+		cal.start = sunday(new Date(focus.getFullYear(), focus.getMonth() - 6, 1));
+		cal.end = addDays(sunday(new Date(focus.getFullYear(), focus.getMonth() + 3, 0)), 6);
+		cal.busy = false;
+		await calLoad(cal.start, cal.end);
+
+		const title = h("h2", { "aria-live": "polite" });
+		const who = h("select", { onchange: (e) => ((cal.employee_id = e.target.value), showCalendar(shownMonth()).catch(fail)) }, h("option", { value: "" }, "Everyone"), st.employees.map((e) => h("option", { value: e.id }, e.name)));
+		who.value = cal.employee_id;
+		const box = h("div", { class: "cal", tabindex: "0", "aria-label": "Calendar. Scroll up or down to change the month." }, calWeeks(cal.start, cal.end));
+		let month = "";
+		const shownMonth = () => new Date(Number(month.slice(0, 4)), Number(month.slice(5)) - 1, 1);
+		// The month in view is the one the top visible week ends in.
+		const mark = () => {
+			const top = box.scrollTop + 4;
+			const row = [...box.children].find((w) => w.offsetTop + w.offsetHeight > top) || box.lastElementChild;
+			if (!row || row.dataset.last === month) return;
+			month = row.dataset.last;
+			title.textContent = monthName.format(shownMonth());
+			for (const c of box.querySelectorAll("button.day")) c.classList.toggle("out", c.dataset.month !== month);
+		};
+		const goTo = (d) => {
+			const key = `${iso(d).slice(0, 7)}`;
+			const row = [...box.children].find((w) => w.classList.contains("first") && w.dataset.last === key);
+			if (row) box.scrollTop = row.offsetTop;
+			mark();
+		};
+		// More months are added as the scrolling nears either end.
+		const grow = async () => {
+			if (cal.busy) return;
+			const up = box.scrollTop < 2 * box.clientHeight;
+			const down = box.scrollHeight - box.scrollTop - box.clientHeight < 2 * box.clientHeight;
+			if (!up && !down) return;
+			cal.busy = true;
+			try {
+				if (up) {
+					const from = sunday(new Date(cal.start.getFullYear(), cal.start.getMonth() - 6, 1));
+					const to = addDays(cal.start, -1);
+					await calLoad(from, to);
+					const before = box.scrollHeight;
+					const at = box.scrollTop;
+					box.prepend(...calWeeks(from, to));
+					box.scrollTop = at + (box.scrollHeight - before);
+					cal.start = from;
+				} else {
+					const from = addDays(cal.end, 1);
+					const to = addDays(sunday(new Date(from.getFullYear(), from.getMonth() + 6, 0)), 6);
+					await calLoad(from, to);
+					box.append(...calWeeks(from, to));
+					cal.end = to;
+				}
+				const keep = month;
+				month = "";
+				mark();
+				if (!month) month = keep;
+			} finally {
+				cal.busy = false;
+			}
+		};
+		let queued = false;
+		box.addEventListener("scroll", () => {
+			if (queued) return;
+			queued = true;
+			requestAnimationFrame(() => {
+				queued = false;
+				mark();
+				grow().catch(fail);
+			});
+		});
+		const base = new Date(2023, 0, 1); // a Sunday
+		const dow = new Intl.DateTimeFormat(undefined, { weekday: "short" });
+		put(
+			$("main"),
+			h("div", { class: "cal-head" }, title, h("div", { class: "row" }, field("Employee", who), h("button", { class: "plain", onclick: () => goTo(new Date()) }, "Today"))),
+			h("div", { class: "cal-wrap" }, h("div", { class: "dow" }, [0, 1, 2, 3, 4, 5, 6].map((i) => h("span", {}, dow.format(addDays(base, i))))), box),
+			h("p", { class: "muted" }, "Hours worked each day. Scroll up or down in the calendar to move through the months; click a day to see its time entries."),
+		);
+		goTo(focus);
+	}
+
 	// ---- tabs -----------------------------------------------------------------------
 	const TABS = [
 		["time", "Time", showTime],
+		["calendar", "Calendar", () => showCalendar()],
 		["billing", "Billable hours", showBilling],
 		["payroll", "Payroll", showPayroll],
 		["people", "People", showPeople],

@@ -11,6 +11,9 @@ newer). Install it under **Settings → Modules** by entering this repository's
 
 - **Time**: time entries per employee, day and project, added by hand or
   pulled from timesheet.io. Each can be billable.
+- **Calendar**: a month of hours worked per day, for everyone or one
+  employee. Scroll up or down in it to move through the months; click a day
+  to open its time entries.
 - **Billable hours**: unbilled billable hours grouped by customer. *Bill*
   posts one journal entry (debit accounts receivable, credit revenue) tagged
   with the customer, marks the hours billed and offers them as a CSV for the
