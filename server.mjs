@@ -311,8 +311,8 @@ export default async function register(ctx) {
 	});
 
 	// ---- billings: bill customers for billable hours ---------------------------------
-	// Each billed time entry posts its own journal entry in the Billable hours account this module
-	// creates: a debit (the item, details in its memo) and a credit of the same amount, with the
+	// Each billed time entry posts its own journal entry in this module's Billable hours clearing
+	// account: a debit (the item, details in its memo) and a credit of the same amount, with the
 	// customer as the entry's entity. Nothing reaches revenue until the hours are invoiced. An invoicing
 	// module picks the debits up as the customer's billable items (Sales: Settings → Sales → Billable
 	// items accounts); it also finds them by the link with ref "billed" (label "Billed").
@@ -506,22 +506,15 @@ export default async function register(ctx) {
 	const itemMemo = (t, c) =>
 		[t.work_date, t.employee_name, `${hours(c.minutes)} h × ${money2(t.rate)}`, [t.project_name, t.description].filter(Boolean).join(": ")].filter(Boolean).join(" · ").slice(0, 500);
 
-	const BILLABLE_ACCOUNT = { name: "Billable hours", type: "asset", description: "Made by the Employees module. Each billed time entry is a debit (the billable item, with the customer on the entry) and an equal credit here, so the balance stays 0 and nothing is revenue until the hours are invoiced. Add this account under Settings → Sales → Billable items." };
-
-	/** The Billable hours account: the one in Settings → Employees if it exists in this currency, else one this module creates. */
-	async function billableAccount(currency) {
-		const settings = await ctx.settings.get();
-		const all = await ctx.ledger.listAccounts({ includeInactive: true });
-		const set = typeof settings.billable_hours_account === "string" ? settings.billable_hours_account.trim() : "";
-		const have = all.find((a) => a.code === set);
-		if (have && have.is_active && have.currency === currency) return have.code;
-		const taken = new Set(all.map((a) => a.code));
-		const code = [...Array.from({ length: 50 }, (_, i) => String(1250 + i)), "BILLHRS", `BILLHRS-${currency}`].find((c) => !taken.has(c));
-		if (!code) throw new ctx.HttpError(409, "Couldn't find a free account code for Billable hours: choose one under Settings → Employees → Billing hours.");
-		const made = await ctx.ledger.createAccount({ ...BILLABLE_ACCOUNT, code, currency });
-		await ctx.settings.set({ billable_hours_account: made.code });
-		ctx.log.info("created the Billable hours account", { code: made.code, replaced: set || null });
-		return made.code;
+	// Billed hours sit in this module's clearing account (Ledger ≥ 0.20.0): made on first use, asked for
+	// each time (people can renumber it), never stored. Each billed time entry is a debit (the billable
+	// item) and an equal credit there, so it stays at zero and nothing is revenue until invoiced.
+	const BILLABLE = { key: "billable", name: "Billable hours", type: "asset", description: "Made by the Employees module. Each billed time entry is a debit (the billable item, with the customer on the entry) and an equal credit here, so the balance stays at zero and nothing is revenue until the hours are invoiced. Add this account under Settings → Sales → Billable costs." };
+	const billableAccount = async (currency) => (await ctx.ledger.clearingAccount({ ...BILLABLE, currency })).code;
+	/** The clearing account if it has been made yet (without making it): { code, name } or null. */
+	async function billableAccountIfMade(currency) {
+		const a = (await ctx.ledger.clearingAccounts()).find((x) => x.module_id === ctx.id && x.module_key === BILLABLE.key && x.currency === currency);
+		return a ? { code: a.code, name: a.name } : null;
 	}
 
 	async function billingSetup(b) {
@@ -1157,7 +1150,8 @@ export default async function register(ctx) {
 			...rows[0],
 			role: req.user.role,
 			currency: currencyOf(s),
-			accounts: Object.fromEntries(["wages_expense_account", "employer_cost_account", "payroll_liabilities_account", "billable_hours_account"].map((k) => [k, s[k] || null])),
+			accounts: Object.fromEntries(["wages_expense_account", "employer_cost_account", "payroll_liabilities_account"].map((k) => [k, s[k] || null])),
+			billable_hours: await billableAccountIfMade(currencyOf(s)),
 			timesheet: { configured: Boolean(s.timesheet_api_key), auto_sync: s.timesheet_auto_sync === true, last_sync: await lastSync() },
 		};
 	});

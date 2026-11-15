@@ -17,7 +17,7 @@ newer). Install it under **Settings → Modules** by entering this repository's
 - **Billable hours**: unbilled billable hours grouped by customer. Tick time
   entries (one by one, a whole customer, or across customers) and press
   *Bill chosen*. **Each time entry posts its own transaction in the
-  *Billable hours* account** the module creates, with the customer on it and
+  module's *Billable hours* clearing account**, with the customer on it and
   tagged **Billed**. Nothing is posted to revenue: that happens when the hours
   are invoiced. Sales picks them up as billable items (see *Invoicing billed
   hours* below). Billed time can be ticked
@@ -49,15 +49,16 @@ every pay run. Use your payroll provider's or tax authority's figures.
 
 ## Invoicing billed hours
 
-The first time hours are billed, the module creates an asset account named
-**Billable hours** (code 1250, or the next free code) and writes its code under
-Settings → Employees → Billing hours. Every billed time entry is one journal entry in that
-account, with the customer as the entry's entity: a **debit** (the billable
-item) and an **equal credit**. So the account's balance stays 0 and **nothing
-is revenue until the hours are invoiced**. In the **Sales** module:
+The first time hours are billed, Ledger makes the module's **clearing
+account** *Billable hours* (Ledger ≥ 0.20.0; code `CLR-EMPLOYEES-BILLABLE`
+unless someone renumbers it). Every billed time entry is one journal entry in
+that account, with the customer as the entry's entity: a **debit** (the
+billable item) and an **equal credit**. So the account stays at zero (the
+Accounts page never flags it) and **nothing is revenue until the hours are
+invoiced**. In the **Sales** module:
 
-1. Under **Settings → Sales**, add the billable hours account as one of the
-   *Billable items* accounts.
+1. Under **Settings → Sales → Accounts → Billable costs**, add the
+   *Billable hours* clearing account.
 2. On a customer's new invoice, **+ Billable items** lists their billed hours,
    one per time entry (date, person, hours × rate, project and task); tick
    them and add them as one line or each as its own line.
@@ -78,8 +79,10 @@ module's tables:
   item: `2026-11-12 · Ana Silva · 7.00 h × 120.00 · Website rebuild: Task t2`
   (the credit line's is "Offset: revenue only once invoiced").
 
-Billings made in 0.4.0 and 0.5.0 posted to revenue (and 0.4.0 to accounts
-receivable); they stay as posted. Unbilling one reverses it as usual.
+Earlier billings stay as posted: 0.4.0 and 0.5.0 posted to revenue (0.4.0 to
+accounts receivable too), and 0.6.0 to 0.8.0 to a *Billable hours* account the
+module made (usually 1250). Keep that account in Sales' billable costs until
+its hours are invoiced; unbilling one reverses it as usual.
 
 An unbilled entry is reversed (`reversed_by_id` is set) and loses its Billed
 tag. Billings made before 0.4.0 are one entry for the whole billing; they get
@@ -146,8 +149,8 @@ that job.
 
 - **Payroll**: the currency (CAD or USD) for all rates, billings and pay
   runs, and the three accounts pay runs are posted to.
-- **Billing hours**: the Billable hours account, filled in by the module
-  when it creates the account the first time hours are billed.
+- **Billing hours**: where billed hours are recorded (the module's clearing
+  account) and how to let Sales invoice them; nothing to fill in.
 - **timesheet.io**: the API key, time zone, days to pull, when to sync (on
   sign-in, hourly), and the connection's status with Sync now.
 

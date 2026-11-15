@@ -11,7 +11,7 @@ node test/mock-timesheet.mjs 8099 &
 mock=$!
 node "$LEDGER_DIR/.claude/skills/ledger-module/scripts/check-module.ts" . --serve 8098 >"$log" 2>&1 &
 ledger=$!
-trap 'kill -INT $ledger 2>/dev/null; kill $mock 2>/dev/null; wait 2>/dev/null; rm -f "$log"' EXIT
+trap 'kill -INT $ledger 2>/dev/null || true; kill $mock 2>/dev/null || true; wait 2>/dev/null || true; rm -f "$log"' EXIT
 for _ in $(seq 60); do
 	grep -q "ledger_session=" "$log" && break
 	kill -0 $ledger 2>/dev/null || { cat "$log"; exit 1; }

@@ -567,9 +567,8 @@
 		}
 
 		function billableNote() {
-			const code = st.summary.accounts.billable_hours_account;
-			const acct = code && st.accounts.find((a) => a.code === code);
-			const where = acct ? `account ${acct.code} · ${acct.name}` : "a Billable hours account this module creates the first time";
+			const acct = st.summary.billable_hours;
+			const where = acct ? `the clearing account ${acct.code} · ${acct.name}` : "a Billable hours clearing account this module makes the first time";
 			return `Each time entry is recorded in ${where}, with the customer on it. Nothing is posted to revenue: that happens when the hours are invoiced. Sales offers each one as a billable item on the customer's next invoice once that account is added under Settings → Sales → Billable items.`;
 		}
 
