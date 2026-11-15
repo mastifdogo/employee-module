@@ -17,7 +17,12 @@ export default async function register(ctx) {
 	const bad = (message) => new ctx.HttpError(422, message);
 
 	// ---- input checks -----------------------------------------------------
-	const isDate = (v) => typeof v === "string" && DATE.test(v) && !Number.isNaN(Date.parse(v));
+	// A day that exists: Date.parse alone takes 2026-02-31 (as 3 March), and PostgreSQL has no year 0.
+	const isDate = (v) => {
+		if (typeof v !== "string" || !DATE.test(v) || v < "0001") return false;
+		const t = Date.parse(`${v}T00:00:00Z`);
+		return !Number.isNaN(t) && new Date(t).toISOString().slice(0, 10) === v;
+	};
 	const reqDate = (v, name) => {
 		if (!isDate(v)) throw bad(`${name} must be a date (YYYY-MM-DD)`);
 		return v;
@@ -271,7 +276,7 @@ export default async function register(ctx) {
 	});
 
 	async function openEntry(id) {
-		const { rows } = await q(`SELECT id, source, billing_id, pay_run_id, timesheet_task_id FROM ${S}.time_entries WHERE id = $1`, [id]);
+		const { rows } = await q(`SELECT id, billing_id, pay_run_id, timesheet_task_id FROM ${S}.time_entries WHERE id = $1`, [id]);
 		if (rows.length === 0) throw new ctx.HttpError(404, "no such time entry");
 		if (rows[0].billing_id !== null) throw new ctx.HttpError(409, "This time is already billed. Reverse the billing to change it.");
 		if (rows[0].pay_run_id !== null) throw new ctx.HttpError(409, "This time is on a pay run. Delete or reverse the pay run to change it.");
@@ -314,8 +319,8 @@ export default async function register(ctx) {
 	// Each billed time entry posts its own journal entry in this module's Billable hours clearing
 	// account: a debit (the item, details in its memo) and a credit of the same amount, with the
 	// customer as the entry's entity. Nothing reaches revenue until the hours are invoiced. An invoicing
-	// module picks the debits up as the customer's billable items (Sales: Settings → Sales → Billable
-	// items accounts); it also finds them by the link with ref "billed" (label "Billed").
+	// module picks the debits up as the customer's billable items (Sales: Settings → Sales → Accounts →
+	// Billable costs); it also finds them by the link with ref "billed" (label "Billed").
 	const BILLED_TAG = { ref: "billed", label: "Billed" };
 	const BILL = `id, customer_entity_id, customer_name, period_start, period_end, billing_date, currency, total_minutes, total_cents, status, journal_entry_id, created_by, created_at, reversed_by, reversed_at`;
 	const idList = (v, name) => {
@@ -633,6 +638,7 @@ export default async function register(ctx) {
 		if (rows[0].status !== "posted") throw new ctx.HttpError(409, `This billing is ${rows[0].status}, not posted.`);
 		// A billing from before 0.4.0 has one journal entry for all its time.
 		await reverseEntryOf(rows[0].journal_entry_id, `Reversal: billed hours ${id} · ${rows[0].customer_name}`, req.user);
+		if (rows[0].journal_entry_id !== null) await ctx.ledger.unlinkJournalEntry(rows[0].journal_entry_id, BILLED_TAG.ref).catch(() => false);
 		const { rows: entries } = await q(`SELECT id, billing_id, billing_journal_entry_id FROM ${S}.time_entries WHERE billing_id = $1`, [id]);
 		await unbill(entries, req.user);
 		await q(`UPDATE ${S}.billings SET status = 'reversed', reversed_by = COALESCE(reversed_by, $2), reversed_at = COALESCE(reversed_at, now()) WHERE id = $1`, [id, req.user.username]);
@@ -868,7 +874,7 @@ export default async function register(ctx) {
 
 		const { rows } = await q(
 			`SELECT t.id, t.work_date, t.minutes, t.description, t.billable, t.updated_at::text AS updated_stamp, t.timesheet_task_id, t.timesheet_task_user_id,
-				t.timesheet_start, t.timesheet_end, t.timesheet_break_seconds, t.push_status,
+				t.timesheet_start, t.timesheet_end, t.timesheet_break_seconds,
 				e.name AS employee_name, e.timesheet_user_id, p.name AS project_name, p.timesheet_project_id,
 				(t.billing_id IS NOT NULL) AS billed, COALESCE(r.status = 'posted', false) AS paid
 			FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id
@@ -915,7 +921,10 @@ export default async function register(ctx) {
 				}
 				task ??= await createTask(key, { ...fields, userId: row.timesheet_user_id });
 				const last = Number(task.lastUpdate);
-				await done("synced", "", { task_id: String(task.id ?? row.timesheet_task_id), user: row.timesheet_user_id, start: t.start, end: t.end, breaks: t.breaks, last_update: Number.isFinite(last) ? Math.trunc(last) : null });
+				const taskId = String(task.id ?? row.timesheet_task_id);
+				const { rowCount } = await done("synced", "", { task_id: taskId, user: row.timesheet_user_id, start: t.start, end: t.end, breaks: t.breaks, last_update: Number.isFinite(last) ? Math.trunc(last) : null });
+				// Deleted in Ledger while this was being sent: its task goes too, or the next pull would bring the time back.
+				if (rowCount === 0) await q(`INSERT INTO ${S}.timesheet_deletions (task_id, requested_by) VALUES ($1, $2) ON CONFLICT (task_id) DO NOTHING`, [taskId, "sync"]);
 				n.sent++;
 			} catch (e) {
 				if (e instanceof TimesheetError && e.status === 409) throw e; // the key: stop here
@@ -979,6 +988,7 @@ export default async function register(ctx) {
 				let id = u.email ? byEmail.get(u.email) : undefined;
 				if (id !== undefined) {
 					await q(`UPDATE ${S}.employees SET timesheet_user_id = $2, updated_at = now() WHERE id = $1`, [id, u.id]);
+					byEmail.delete(u.email); // linked now: a second account with the same email is someone else
 				} else {
 					const name = u.name || `timesheet.io user ${u.id.slice(0, 8)}`;
 					for (const candidate of [name, `${name} (timesheet.io)`.slice(0, 200), `${name.slice(0, 150)} (timesheet.io ${u.id.slice(0, 8)})`]) {
@@ -1062,7 +1072,7 @@ export default async function register(ctx) {
 				);
 				if (r.rows.length === 0) {
 					// Changed in Ledger meanwhile: Ledger wins.
-					const now = (await q(`SELECT id, push_status, (billing_id IS NOT NULL OR pay_run_id IS NOT NULL) AS locked FROM ${S}.time_entries WHERE timesheet_task_id = $1`, [t.id])).rows[0];
+					const now = (await q(`SELECT id FROM ${S}.time_entries WHERE timesheet_task_id = $1`, [t.id])).rows[0];
 					if (now) await keep(now);
 				} else if (r.rows[0].inserted) n.added++;
 				else n.updated++;

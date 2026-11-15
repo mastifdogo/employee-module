@@ -46,6 +46,8 @@ const proj = await ok(m("POST", "/projects", { name: "Audit", customer_entity_id
 await ok(m("POST", "/projects", { name: "X", customer_entity_id: 999999 }), 422);
 const e1 = await ok(m("POST", "/time", { employee_id: ana.id, project_id: proj.id, work_date: day(4), minutes: 90, billable: true, description: "Review" }), 201);
 await ok(m("POST", "/time", { employee_id: ana.id, work_date: "2026-13-40", minutes: 90 }), 422);
+for (const d of ["2026-02-31", "0000-01-01"]) assert.match((await ok(m("POST", "/time", { employee_id: ana.id, work_date: d, minutes: 90 }), 422)).error.message, /^date must be a date/); // a day that doesn't exist
+assert.match((await ok(m("GET", "/time?from=2026-04-31"), 422)).error.message, /^from must be a date/);
 await ok(m("POST", "/time", { employee_id: ana.id, work_date: day(4), minutes: 0 }), 422);
 await ok(m("PATCH", `/time/${e1.id}`, { minutes: 120 }));
 step("employees, customer, project and manual time");
@@ -135,7 +137,7 @@ assert.equal(entry.lines[0].memo, `${day(2)} · Ana S. · 7.00 h × 120.00 · We
 const acmeItems = await salesItems(acme.id);
 assert.deepEqual(acmeItems.map((i) => i.cents).sort(), [24000, 36000, 84000]); // one item per time entry, for Sales to invoice
 assert.deepEqual(entry.links.map((l) => [l.module_id, l.ref, l.label]).sort(), [["employees", "billed", "Billed"], ["employees", `time:${t2.id}`, `Hours ${day(2)} · Ana S. · 7.00 h`]]);
-await ok(m("POST", "/billings", { customer_entity_id: acme.id, period_start: day(30), period_end: day(0) }), 422); // nothing left (accounts now remembered)
+await ok(m("POST", "/billings", { customer_entity_id: acme.id, period_start: day(30), period_end: day(0) }), 422); // nothing left
 await ok(m("PATCH", `/time/${t2.id}`, { bill_rate_cents: 1 }), 409);
 const globex = await ok(m("POST", "/billings", { customer_entity_id: cust.id, period_start: day(30), period_end: day(0) }), 201);
 assert.equal(globex.total_cents, 30000); // 2 h at the project's 150.00

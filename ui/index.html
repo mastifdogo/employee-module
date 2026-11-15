@@ -254,10 +254,12 @@
 		return sel;
 	}
 
-	function customerSelect(selected) {
+	function customerSelect(selected, selectedName) {
 		const sel = h("select", {});
 		const fill = (pick) => {
-			put(sel, h("option", { value: "" }, "No customer"), st.customers.map((c) => h("option", { value: c.id }, c.name)), canEdit() ? h("option", { value: "+" }, "+ New customer…") : null);
+			// A customer made inactive isn't in the list: keep it as a choice, or saving would drop it.
+			const kept = selected !== null && selected !== undefined && selectedName && !st.customers.some((c) => String(c.id) === String(selected)) ? h("option", { value: selected }, `${selectedName} (inactive)`) : null;
+			put(sel, h("option", { value: "" }, "No customer"), kept, st.customers.map((c) => h("option", { value: c.id }, c.name)), canEdit() ? h("option", { value: "+" }, "+ New customer…") : null);
 			sel.value = pick === null || pick === undefined ? "" : String(pick);
 		};
 		fill(selected);
@@ -440,8 +442,8 @@
 
 	// ---- Billable hours ---------------------------------------------------------
 	const billPeriod = { from: "", to: today() };
-	const toBill = new Set(); // ids of unbilled time entries chosen for "Bill selected"
-	const toUnbill = new Set(); // ids of billed time entries chosen for "Unbill selected"
+	const toBill = new Set(); // ids of unbilled time entries chosen for "Bill chosen"
+	const toUnbill = new Set(); // ids of billed time entries chosen for "Unbill chosen"
 
 	function downloadCsv(name, rows) {
 		const esc = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
@@ -569,7 +571,7 @@
 		function billableNote() {
 			const acct = st.summary.billable_hours;
 			const where = acct ? `the clearing account ${acct.code} · ${acct.name}` : "a Billable hours clearing account this module makes the first time";
-			return `Each time entry is recorded in ${where}, with the customer on it. Nothing is posted to revenue: that happens when the hours are invoiced. Sales offers each one as a billable item on the customer's next invoice once that account is added under Settings → Sales → Billable items.`;
+			return `Each time entry is recorded in ${where}, with the customer on it. Nothing is posted to revenue: that happens when the hours are invoiced. Sales offers each one as a billable item on the customer's next invoice once that account is added under Settings → Sales → Accounts → Billable costs.`;
 		}
 
 		function billDialog(chosen) {
@@ -606,7 +608,7 @@
 			if (!groups.has(key)) groups.set(key, []);
 			groups.get(key).push(t);
 		}
-		const name = (id) => st.customers.find((c) => String(c.id) === id)?.name ?? "A customer no longer in Entities";
+		const name = (id) => st.customers.find((c) => String(c.id) === id)?.name ?? st.projects.find((p) => String(p.customer_entity_id) === id)?.customer_name ?? "A customer no longer in Entities";
 		const cards = [...groups]
 			.sort(([a], [b]) => (a === "" ? 1 : b === "" ? -1 : name(a).localeCompare(name(b))))
 			.map(([key, list]) => {
@@ -875,7 +877,7 @@
 
 	function projectDialog(p) {
 		const name = h("input", { required: true, maxlength: 200, value: p?.name ?? "", disabled: Boolean(p?.timesheet_project_id) });
-		const cust = customerSelect(p?.customer_entity_id);
+		const cust = customerSelect(p?.customer_entity_id, p?.customer_name);
 		const rate = h("input", { class: "num", inputmode: "decimal", placeholder: "the employee's rate", value: dollars(p?.bill_rate_cents) });
 		const active = h("input", { type: "checkbox", checked: p?.is_active ?? true });
 		dialog(
