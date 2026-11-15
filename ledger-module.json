@@ -1,9 +1,9 @@
 {
   "id": "employees",
   "name": "Employees",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Track employee time, bill customers for billable hours and run payroll, with time pulled from timesheet.io.",
-  "ledger": ">=0.16.0",
+  "ledger": ">=0.19.6",
   "server": "server.mjs",
   "ui": "ui",
   "nav": {
@@ -14,19 +14,23 @@
   },
   "migrations": "migrations",
   "settings": {
-    "page": "settings.html",
+    "tabs": [
+      { "id": "payroll", "label": "Payroll", "help": "The currency everything is in, and the accounts pay runs are posted to. Account codes are the ones under Accounts." },
+      { "id": "billing", "label": "Billing hours", "help": "The accounts billed time is posted to, for Sales to invoice." },
+      { "id": "timesheet", "label": "timesheet.io", "help": "Keeps Ledger's time entries and timesheet.io's tasks the same, both ways.", "page": "settings.html" }
+    ],
     "fields": [
       { "key": "currency", "label": "Currency", "type": "select", "options": ["CAD", "USD"], "default": "CAD", "help": "Pay rates, billing rates, billings and pay runs are all in this currency." },
       { "key": "wages_expense_account", "label": "Wages expense account code", "type": "text", "help": "Debited with gross pay when a pay run is posted. Can also be chosen when posting." },
       { "key": "employer_cost_account", "label": "Employer payroll cost account code", "type": "text", "help": "Expense account for the employer's share (pension, insurance, payroll taxes)." },
       { "key": "payroll_liabilities_account", "label": "Payroll liabilities account code", "type": "text", "help": "Liability account credited with amounts withheld from pay plus the employer's share, until they are remitted." },
-      { "key": "billable_hours_account", "label": "Billable hours account code", "type": "text", "help": "Debited for each billed time entry, with the customer on the transaction (an asset account, e.g. 1250 Unbilled billable hours). Add it under Settings → Sales → Billable items so Sales offers the hours on the customer's next invoice." },
-      { "key": "revenue_account", "label": "Revenue account for billed hours", "type": "text", "help": "Credited for each billed time entry." },
-      { "key": "timesheet_api_key", "label": "timesheet.io API key", "type": "secret", "help": "Create one at my.timesheet.io → Development → API keys. It looks like ts_xxxx.yyyy. Time is synced both ways: changes made in Ledger are sent to timesheet.io and win." },
-      { "key": "timesheet_time_zone", "label": "Time zone for time sent to timesheet.io", "type": "text", "default": "", "help": "For time entered in Ledger, which starts at 9:00 there, e.g. America/Toronto. Empty: UTC." },
-      { "key": "timesheet_sync_days", "label": "Days of time to pull from timesheet.io", "type": "number", "min": 1, "max": 730, "default": 60, "help": "Each sync re-reads this many days back, so edits made in timesheet.io are picked up." },
-      { "key": "timesheet_sync_on_login", "label": "Pull from timesheet.io when someone signs in to Ledger", "type": "boolean", "default": true },
-      { "key": "timesheet_auto_sync", "label": "Pull from timesheet.io every hour", "type": "boolean", "default": false }
+      { "key": "billable_hours_account", "label": "Billable hours account code", "type": "text", "help": "Debited for each billed time entry, with the customer on the transaction (an asset account, e.g. 1250 Unbilled billable hours). Add it under Settings → Sales → Billable items so Sales offers the hours on the customer's next invoice.", "tab": "billing" },
+      { "key": "revenue_account", "label": "Revenue account for billed hours", "type": "text", "help": "Credited for each billed time entry.", "tab": "billing" },
+      { "key": "timesheet_api_key", "label": "timesheet.io API key", "type": "secret", "help": "Create one at my.timesheet.io → Development → API keys. It looks like ts_xxxx.yyyy. Time is synced both ways: changes made in Ledger are sent to timesheet.io and win.", "tab": "timesheet" },
+      { "key": "timesheet_time_zone", "label": "Time zone for time sent to timesheet.io", "type": "text", "default": "", "help": "For time entered in Ledger, which starts at 9:00 there, e.g. America/Toronto. Empty: UTC.", "tab": "timesheet" },
+      { "key": "timesheet_sync_days", "label": "Days of time to pull from timesheet.io", "type": "number", "min": 1, "max": 730, "default": 60, "help": "Each sync re-reads this many days back, so edits made in timesheet.io are picked up.", "tab": "timesheet" },
+      { "key": "timesheet_sync_on_login", "label": "Pull from timesheet.io when someone signs in to Ledger", "type": "boolean", "default": true, "tab": "timesheet" },
+      { "key": "timesheet_auto_sync", "label": "Pull from timesheet.io every hour", "type": "boolean", "default": false, "tab": "timesheet" }
     ]
   }
 }

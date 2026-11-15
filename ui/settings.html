@@ -36,13 +36,12 @@
 </style>
 </head>
 <body>
-<h2 style="margin-top: 0">timesheet.io</h2>
 <div id="msg"></div>
 <main id="main"></main>
 
 <script>
 	"use strict";
-	// Shown by Ledger under Settings → Employees, below the settings form.
+	// Shown by Ledger on the timesheet.io tab of Settings → Employees, below that tab's fields.
 	const api = (path, opts = {}) =>
 		fetch(`/api/v1/m/employees${path}`, { ...opts, headers: { "Content-Type": "application/json", ...(opts.headers || {}) } }).then(async (r) => {
 			if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error?.message || r.statusText);
@@ -79,7 +78,7 @@
 		const canEdit = summary.role !== "viewer";
 		const last = s.last_sync;
 		$("main").replaceChildren(
-			h("p", {}, "Keeps Ledger's time entries and timesheet.io's tasks the same, both ways. When the same entry changed in both places, Ledger's version wins."),
+			h("p", {}, "When the same entry changed in both places, Ledger's version wins."),
 			s.configured
 				? h(
 						"div",

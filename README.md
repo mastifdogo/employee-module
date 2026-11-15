@@ -49,7 +49,7 @@ every pay run. Use your payroll provider's or tax authority's figures.
 ## Invoicing billed hours
 
 Every billed time entry is one journal entry: a **debit to the billable hours
-account** (Settings → Employees) and a credit to revenue, with the customer as
+account** (Settings → Employees → Billing hours) and a credit to revenue, with the customer as
 the entry's entity. In the **Sales** module:
 
 1. Under **Settings → Sales**, add the billable hours account as one of the
@@ -138,10 +138,16 @@ that job.
 
 ## Settings
 
-Currency (CAD or USD) for all rates, billings and pay runs; the five account
-codes used when posting (each can also be picked, or created, in the dialog
-that posts, and the first choice is remembered); the timesheet.io key, time zone,
-days to pull, and when to sync (on sign-in, hourly).
+**Settings → Employees** has three tabs (0.6.0, Ledger 0.19.6):
+
+- **Payroll**: the currency (CAD or USD) for all rates, billings and pay
+  runs, and the three accounts pay runs are posted to.
+- **Billing hours**: the billable hours account and the revenue account.
+- **timesheet.io**: the API key, time zone, days to pull, when to sync (on
+  sign-in, hourly), and the connection's status with Sync now.
+
+Each account can also be picked, or created, in the dialog that posts, and
+the first choice is remembered.
 
 Rates: an hour is billed at the entry's own rate if it has one, else the
 project's, else the employee's.

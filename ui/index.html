@@ -392,7 +392,7 @@
 					),
 			),
 			data.length === 0
-				? empty(st.summary.timesheet.configured ? "No time in this period. Add some, or sync timesheet.io." : "No time in this period. Add some here, or connect timesheet.io under Settings → Employees to pull it in.")
+				? empty(st.summary.timesheet.configured ? "No time in this period. Add some, or sync timesheet.io." : "No time in this period. Add some here, or connect timesheet.io under Settings → Employees → timesheet.io to pull it in.")
 				: table(
 						["Date", "Employee", "Project", "What", "#Hours", "#Rate", "#Amount", "", ""],
 						data.map((t) => {

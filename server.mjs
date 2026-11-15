@@ -836,7 +836,7 @@ export default async function register(ctx) {
 		try {
 			zoneOffset(timeZone, today());
 		} catch {
-			throw new TimesheetError(409, `The time zone "${timeZone}" under Settings → Employees isn't one timesheet.io times can use (try e.g. America/Toronto).`);
+			throw new TimesheetError(409, `The time zone "${timeZone}" under Settings → Employees → timesheet.io isn't one timesheet.io times can use (try e.g. America/Toronto).`);
 		}
 		const n = { sent: 0, failed: 0, ledger_only: 0, deleted: 0 };
 
