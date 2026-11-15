@@ -138,7 +138,7 @@ that job.
 
 ## Settings
 
-**Settings → Employees** has three tabs (0.6.0, Ledger 0.19.6):
+**Settings → Employees** has three tabs (accounts are chosen from a list since 0.7.0, which needs Ledger 0.19.8):
 
 - **Payroll**: the currency (CAD or USD) for all rates, billings and pay
   runs, and the three accounts pay runs are posted to.
