@@ -111,9 +111,13 @@ const bill = await ok(m("POST", "/billings", { customer_entity_id: acme.id, peri
 assert.equal(bill.total_minutes, 180 + 420 + 120);
 assert.equal(bill.total_cents, 12 * 12000);
 assert.equal(bill.status, "posted");
-const entry = await ok(call("GET", `/api/v1/journal-entries/${bill.journal_entry_id}`));
-assert.equal(entry.links[0].ref, `billing:${bill.id}`);
+assert.equal(bill.journal_entry_id, null); // one journal entry per time entry, not one per billing
+const billedT2 = await entryBy((t) => t.id === t2.id);
+assert.ok(billedT2.billing_journal_entry_id);
+const entry = await ok(call("GET", `/api/v1/journal-entries/${billedT2.billing_journal_entry_id}`));
 assert.equal(entry.entity?.name, "Acme Corp");
+assert.deepEqual(entry.lines.map((l) => [l.account_code, Number(l.debit_cents), Number(l.credit_cents)]), [["1200", 84000, 0], ["4100", 0, 84000]]); // 7 h at 120.00
+assert.deepEqual(entry.links.map((l) => [l.module_id, l.ref, l.label]).sort(), [["employees", "billed", "Billed"], ["employees", `time:${t2.id}`, `Hours ${day(2)} · Ana S. · 7.00 h`]]);
 await ok(m("POST", "/billings", { customer_entity_id: acme.id, period_start: day(30), period_end: day(0) }), 422); // nothing left (accounts now remembered)
 await ok(m("PATCH", `/time/${t2.id}`, { bill_rate_cents: 1 }), 409);
 const globex = await ok(m("POST", "/billings", { customer_entity_id: cust.id, period_start: day(30), period_end: day(0) }), 201);
@@ -149,11 +153,36 @@ step("changed in both places: Ledger wins; changed only in timesheet.io: taken")
 
 await ok(m("POST", `/billings/${bill.id}/reverse`));
 await ok(m("POST", `/billings/${bill.id}/reverse`), 409);
-assert.equal((await ok(call("GET", `/api/v1/journal-entries/${bill.journal_entry_id}`))).reversed_by_id !== null, true);
+assert.notEqual((await ok(call("GET", `/api/v1/journal-entries/${billedT2.billing_journal_entry_id}`))).reversed_by_id, null);
 assert.equal((await ok(m("GET", "/time?show=billable"))).data.length, 3);
 await settle();
 assert.equal((await mt("t1")).billed, false);
+assert.equal((await ok(call("GET", `/api/v1/journal-entries/${billedT2.billing_journal_entry_id}`))).links.some((l) => l.ref === "billed"), false); // reversed: no longer tagged Billed
 step("billing reversed; hours billable again, and not billed in timesheet.io");
+
+// Batch: bill chosen time entries at once; what can't be billed is skipped with the reason
+const pick = await Promise.all(["Task t1", "Edited in Ledger", "Task t4", "Task t3"].map((d) => entryBy((t) => t.description === d)));
+await ok(m("POST", "/billings/batch", { entry_ids: [] }), 422);
+await ok(m("POST", "/billings/batch", { entry_ids: [pick[3].id] }), 422); // t3 isn't billable: nothing to bill
+const batch = await ok(m("POST", "/billings/batch", { entry_ids: pick.map((t) => t.id), billing_date: day(0) }), 201);
+assert.equal(batch.billed, 3);
+assert.equal(batch.total_cents, 12 * 12000);
+assert.equal(batch.billings.length, 1); // one customer
+assert.deepEqual(batch.skipped.map((x) => [x.id, x.reason]), [[pick[3].id, "not billable"]]);
+await ok(m("POST", "/billings/batch", { entry_ids: [pick[0].id] }), 422); // already billed
+const batchT1 = await entryBy((t) => t.id === pick[0].id);
+assert.ok((await ok(call("GET", `/api/v1/journal-entries/${batchT1.billing_journal_entry_id}`))).links.some((l) => l.ref === "billed" && l.label === "Billed"));
+// Batch unbill: those entries' transactions are reversed and lose the tag; the billing keeps the rest
+const unb = await ok(m("POST", "/billed/unbill", { entry_ids: [pick[1].id, pick[3].id] }));
+assert.deepEqual([unb.unbilled, unb.skipped.length], [1, 1]);
+const reversed = await ok(call("GET", `/api/v1/journal-entries/${(await entryBy((t) => t.id === pick[0].id)).billing_journal_entry_id}`));
+assert.equal(reversed.reversed_by_id, null); // t1 is still billed
+const left = await ok(m("GET", `/billings/${batch.billings[0].id}`));
+assert.deepEqual([left.lines.length, Number(left.total_cents), left.status], [2, 5 * 12000, "posted"]);
+await ok(m("POST", "/billed/unbill", { entry_ids: [pick[0].id, pick[2].id] }));
+assert.equal((await ok(m("GET", `/billings/${batch.billings[0].id}`))).status, "reversed"); // nothing left on it
+assert.equal((await ok(m("GET", "/time?show=billable"))).data.length, 3);
+step("batch billing and batch unbill, one tagged transaction per time entry");
 
 // Payroll
 await ok(m("POST", "/pay-runs", { period_start: "2020-01-01", period_end: "2019-01-01" }), 422);

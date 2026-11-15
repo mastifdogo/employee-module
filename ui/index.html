@@ -83,6 +83,11 @@
 		button.day small, button.day b span { display: none; }
 		button.day b { font-size: 0.8rem; }
 	}
+	.batchbar { position: sticky; bottom: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; padding: 0.5rem 0.6rem; margin: 0.5rem 0; background: var(--soft); border: 1px solid var(--border); border-radius: 6px; }
+	.batchbar span { flex: 1 1 12rem; }
+	td.pick { width: 1.8rem; }
+	.pickhead { display: inline-flex; align-items: center; gap: 0.5rem; }
+	input[type="checkbox"] { accent-color: var(--accent); }
 	[hidden] { display: none !important; }
 </style>
 </head>
@@ -435,6 +440,8 @@
 
 	// ---- Billable hours ---------------------------------------------------------
 	const billPeriod = { from: "", to: today() };
+	const toBill = new Set(); // ids of unbilled time entries chosen for "Bill selected"
+	const toUnbill = new Set(); // ids of billed time entries chosen for "Unbill selected"
 
 	function downloadCsv(name, rows) {
 		const esc = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
@@ -442,6 +449,8 @@
 		h("a", { href: url, download: name }).click();
 		setTimeout(() => URL.revokeObjectURL(url), 5000);
 	}
+
+	const journalLink = (id, text = `Entry ${id}`) => (id === null || id === undefined ? "" : h("a", { href: `/journal/${id}`, target: "_top" }, text));
 
 	async function openBilling(id) {
 		const b = await api(`/billings/${id}`);
@@ -451,9 +460,9 @@
 				"div",
 				{},
 				h("p", {}, `${b.period_start} to ${b.period_end}, billed ${b.billing_date}: ${hrs(b.total_minutes)} h, ${money(b.total_cents)} ${b.currency} `, chip(b.status, b.status === "posted" ? "ok" : "bad")),
-				b.journal_entry_id !== null && h("p", {}, h("a", { href: `/journal/${b.journal_entry_id}`, target: "_top" }, `Journal entry ${b.journal_entry_id}`)),
+				b.journal_entry_id !== null && h("p", {}, journalLink(b.journal_entry_id, `Journal entry ${b.journal_entry_id}`), h("small", {}, " (one entry for this whole billing, made before each time entry had its own)")),
 				b.lines.length
-					? table(["Date", "Employee", "Project", "What", "#Hours", "#Rate", "#Amount"], b.lines.map((t) => h("tr", {}, h("td", {}, t.work_date), h("td", {}, t.employee_name), h("td", {}, t.project_name ?? ""), h("td", {}, t.description), h("td", { class: "n" }, hrs(t.minutes)), h("td", { class: "n" }, money(t.rate_cents)), h("td", { class: "n" }, money(t.amount_cents)))))
+					? table(["Date", "Employee", "Project", "What", "#Hours", "#Rate", "#Amount", "Entry"], b.lines.map((t) => h("tr", {}, h("td", {}, t.work_date), h("td", {}, t.employee_name), h("td", {}, t.project_name ?? ""), h("td", {}, t.description), h("td", { class: "n" }, hrs(t.minutes)), h("td", { class: "n" }, money(t.rate_cents)), h("td", { class: "n" }, money(t.amount_cents)), h("td", {}, journalLink(t.billing_journal_entry_id)))))
 					: empty("Reversed: its hours are billable again."),
 				b.lines.length > 0 &&
 					h(
@@ -476,9 +485,113 @@
 		);
 	}
 
+	/** Why an unbilled entry can't be billed yet, or null. */
+	const cantBill = (t) => (t.customer_entity_id === null ? (t.project_name ? `The project ${t.project_name} has no customer (People tab → Projects).` : "No project, so no customer.") : Number(t.rate_cents) > 0 ? null : "No billing rate: set one on the project, the employee or the entry.");
+
+	/** A checkbox bound to a selection set; onchange redraws the action bar. */
+	function pickBox(set, id, redraw, disabledWhy) {
+		const box = h("input", { type: "checkbox", "aria-label": "Choose", checked: set.has(id), disabled: Boolean(disabledWhy) });
+		if (disabledWhy) box.title = disabledWhy;
+		box.onchange = () => {
+			box.checked ? set.add(id) : set.delete(id);
+			redraw();
+		};
+		return box;
+	}
+
+	/** "Choose all" for a list of ids. */
+	function allBox(set, ids, redraw, label = "Choose all") {
+		const box = h("input", { type: "checkbox", "aria-label": label, disabled: ids.length === 0 });
+		const sync = () => {
+			const n = ids.filter((id) => set.has(id)).length;
+			box.checked = ids.length > 0 && n === ids.length;
+			box.indeterminate = n > 0 && n < ids.length;
+		};
+		sync();
+		box.onchange = () => {
+			for (const id of ids) box.checked ? set.add(id) : set.delete(id);
+			redraw();
+		};
+		box.sync = sync;
+		return box;
+	}
+
 	async function showBilling() {
-		const qs = new URLSearchParams({ show: "billable", ...(billPeriod.from ? { from: billPeriod.from } : {}), ...(billPeriod.to ? { to: billPeriod.to } : {}) });
-		const [{ data: open }, { data: done }] = await Promise.all([api(`/time?${qs}`), api("/billings")]);
+		const range = { ...(billPeriod.from ? { from: billPeriod.from } : {}), ...(billPeriod.to ? { to: billPeriod.to } : {}) };
+		const [{ data: open }, { data: billed }, { data: done }] = await Promise.all([
+			api(`/time?${new URLSearchParams({ show: "billable", ...range })}`),
+			api(`/time?${new URLSearchParams({ show: "billed", ...range })}`),
+			api("/billings"),
+		]);
+		const openIds = new Set(open.map((t) => t.id));
+		for (const id of [...toBill]) if (!openIds.has(id)) toBill.delete(id);
+		const billedIds = new Set(billed.map((t) => t.id));
+		for (const id of [...toUnbill]) if (!billedIds.has(id)) toUnbill.delete(id);
+		const reload = () => Promise.all([showBilling(), refreshSummary()]);
+		const edit = canEdit();
+		const boxes = [];
+
+		// The action bars, redrawn as boxes are ticked.
+		const billBar = h("div", { class: "batchbar" });
+		const unbillBar = h("div", { class: "batchbar" });
+		function redraw() {
+			for (const b of boxes) b.sync?.();
+			const chosen = open.filter((t) => toBill.has(t.id));
+			put(
+				billBar,
+				h("span", {}, chosen.length ? `${chosen.length} chosen · ${hrs(chosen.reduce((a, t) => a + t.minutes, 0))} h · ${moneyC(chosen.reduce((a, t) => a + Number(t.amount_cents), 0))}` : "Choose time entries to bill."),
+				h("button", { disabled: chosen.length === 0, onclick: () => billDialog(chosen) }, "Bill chosen…"),
+				chosen.length > 0 && h("button", { class: "plain", onclick: () => (toBill.clear(), redraw()) }, "Clear"),
+			);
+			const unchosen = billed.filter((t) => toUnbill.has(t.id));
+			put(
+				unbillBar,
+				h("span", {}, unchosen.length ? `${unchosen.length} chosen · ${moneyC(unchosen.reduce((a, t) => a + Number(t.amount_cents), 0))}` : "Choose billed time entries to unbill."),
+				h(
+					"button",
+					{
+						class: "danger",
+						disabled: unchosen.length === 0,
+						onclick: act(async () => {
+							if (!confirm(`Unbill ${unchosen.length} time ${unchosen.length === 1 ? "entry" : "entries"}? ${unchosen.length === 1 ? "Its transaction is" : "Their transactions are"} reversed and the hours become billable again.`)) return;
+							const r = await send("POST", "/billed/unbill", { entry_ids: unchosen.map((t) => t.id) });
+							toUnbill.clear();
+							await reload();
+							say(`Unbilled ${r.unbilled} time ${r.unbilled === 1 ? "entry" : "entries"}.${r.skipped.length ? ` ${r.skipped.length} left as they were: ${[...new Set(r.skipped.map((x) => x.reason))].join("; ")}.` : ""}`);
+						}),
+					},
+					"Unbill chosen",
+				),
+				unchosen.length > 0 && h("button", { class: "plain", onclick: () => (toUnbill.clear(), redraw()) }, "Clear"),
+			);
+		}
+
+		function billDialog(chosen) {
+			const date = h("input", { type: "date", required: true, value: today() });
+			const ar = accountSelect({ types: ["asset"], selected: st.summary.accounts.receivable_account, defaults: { name: "Accounts receivable" } });
+			const rev = accountSelect({ types: ["revenue"], selected: st.summary.accounts.revenue_account, defaults: { name: "Billable hours" } });
+			const customers = new Set(chosen.map((t) => t.customer_entity_id)).size;
+			dialog(
+				`Bill ${chosen.length} time ${chosen.length === 1 ? "entry" : "entries"}`,
+				h(
+					"div",
+					{},
+					h("p", {}, `${hrs(chosen.reduce((a, t) => a + t.minutes, 0))} h for ${customers} ${customers === 1 ? "customer" : "customers"}: ${moneyC(chosen.reduce((a, t) => a + Number(t.amount_cents), 0))}.`),
+					h("p", { class: "muted" }, "Each time entry posts its own transaction: debit accounts receivable, credit the billable hours account, with the customer on it and tagged Billed so other modules can find it."),
+					h("div", { class: "row" }, field("Billing date", date)),
+					h("div", { class: "row" }, field("Accounts receivable", ar), field("Billable hours account", rev)),
+				),
+				"Bill",
+				async () => {
+					const r = await send("POST", "/billings/batch", { entry_ids: chosen.map((t) => t.id), billing_date: date.value, receivable_account: ar.value, revenue_account: rev.value });
+					toBill.clear();
+					await reload();
+					say(`Billed ${r.billed} time ${r.billed === 1 ? "entry" : "entries"}, ${moneyC(r.total_cents)}.${r.skipped.length ? ` ${r.skipped.length} not billed: ${[...new Set(r.skipped.map((x) => x.reason))].join("; ")}.` : ""}`);
+				},
+			);
+		}
+
+		// Unbilled, by customer
 		const groups = new Map();
 		for (const t of open) {
 			const key = t.customer_entity_id === null ? "" : String(t.customer_entity_id);
@@ -486,65 +599,73 @@
 			groups.get(key).push(t);
 		}
 		const name = (id) => st.customers.find((c) => String(c.id) === id)?.name ?? "A customer no longer in Entities";
-		const reload = () => Promise.all([showBilling(), refreshSummary()]);
-		const cards = [...groups].sort(([a], [b]) => (a === "" ? 1 : b === "" ? -1 : name(a).localeCompare(name(b)))).map(([key, list]) => {
-			const billableNow = list.filter((t) => t.rate_cents > 0);
-			const total = billableNow.reduce((a, t) => a + Number(t.amount_cents), 0);
-			const dates = list.map((t) => t.work_date).sort();
-			return h(
-				"div",
-				{ class: "card" },
-				h(
-					"h3",
-					{},
-					key === "" ? "No customer yet" : name(key),
-					key !== "" &&
-						canEdit() &&
-						h(
-							"button",
-							{
-								disabled: total <= 0,
-								onclick: () => {
-									const date = h("input", { type: "date", required: true, value: today() });
-									const ar = accountSelect({ types: ["asset"], selected: st.summary.accounts.receivable_account, defaults: { name: "Accounts receivable" } });
-									const rev = accountSelect({ types: ["revenue"], selected: st.summary.accounts.revenue_account, defaults: { name: "Service revenue" } });
-									const from = billPeriod.from || dates[0];
-									const to = billPeriod.to || dates[dates.length - 1];
-									dialog(
-										`Bill ${name(key)}`,
-										h(
-											"div",
-											{},
-											h("p", {}, `${hrs(billableNow.reduce((a, t) => a + t.minutes, 0))} h from ${from} to ${to}: ${moneyC(total)}.`),
-											h("p", { class: "muted" }, "Posts a journal entry: debit receivable, credit revenue. The hours are then marked billed."),
-											h("div", { class: "row" }, field("Billing date", date)),
-											h("div", { class: "row" }, field("Accounts receivable", ar), field("Revenue", rev)),
-										),
-										"Bill hours",
-										async () => {
-											const b = await send("POST", "/billings", { customer_entity_id: Number(key), period_start: from, period_end: to, billing_date: date.value, receivable_account: ar.value, revenue_account: rev.value });
-											await reload();
-											say(`Billed ${money(b.total_cents)} ${b.currency} to ${b.customer_name} (journal entry ${b.journal_entry_id}).`);
-										},
-									);
-								},
-							},
-							`Bill ${moneyC(total)}`,
+		const cards = [...groups]
+			.sort(([a], [b]) => (a === "" ? 1 : b === "" ? -1 : name(a).localeCompare(name(b))))
+			.map(([key, list]) => {
+				const ids = list.filter((t) => !cantBill(t)).map((t) => t.id);
+				const all = edit && allBox(toBill, ids, redraw, `Choose all of ${key === "" ? "these" : name(key)}`);
+				if (all) boxes.push(all);
+				return h(
+					"div",
+					{ class: "card" },
+					h("h3", {}, h("span", { class: "pickhead" }, all, key === "" ? "No customer yet" : name(key)), h("small", {}, `${hrs(list.reduce((a, t) => a + t.minutes, 0))} h · ${moneyC(list.reduce((a, t) => a + Number(t.amount_cents), 0))}`)),
+					key === "" && h("p", { class: "muted" }, "These hours can't be billed until their project has a customer (People tab → Projects), or the entry has a project."),
+					table(
+						[edit ? " " : "", "Date", "Employee", "Project", "What", "#Hours", "#Rate", "#Amount"],
+						list.map((t) =>
+							h(
+								"tr",
+								{},
+								h("td", { class: "pick" }, edit && pickBox(toBill, t.id, redraw, cantBill(t))),
+								h("td", { style: "white-space: nowrap" }, t.work_date),
+								h("td", {}, t.employee_name),
+								h("td", {}, t.project_name ?? h("span", { class: "muted" }, "—")),
+								h("td", {}, t.description),
+								h("td", { class: "n" }, hrs(t.minutes)),
+								h("td", { class: "n" }, Number(t.rate_cents) > 0 ? money(t.rate_cents) : chip("no rate", "warn")),
+								h("td", { class: "n" }, money(t.amount_cents)),
+							),
 						),
-				),
-				key === "" && h("p", { class: "muted" }, "These hours can't be billed until their project has a customer (People tab → Projects), or the entry has a project."),
-				list.some((t) => t.rate_cents === 0n || Number(t.rate_cents) === 0) && h("p", { class: "muted" }, "Hours without a billing rate are left out: set a rate on the project, the employee or the entry."),
-				table(
-					["Date", "Employee", "Project", "What", "#Hours", "#Rate", "#Amount"],
-					list.map((t) => h("tr", {}, h("td", { style: "white-space: nowrap" }, t.work_date), h("td", {}, t.employee_name), h("td", {}, t.project_name ?? h("span", { class: "muted" }, "—")), h("td", {}, t.description), h("td", { class: "n" }, hrs(t.minutes)), h("td", { class: "n" }, Number(t.rate_cents) > 0 ? money(t.rate_cents) : chip("no rate", "warn")), h("td", { class: "n" }, money(t.amount_cents)))),
-					h("tr", {}, h("td", { colspan: 4 }), h("td", { class: "n" }, hrs(list.reduce((a, t) => a + t.minutes, 0))), h("td", {}), h("td", { class: "n" }, money(list.reduce((a, t) => a + Number(t.amount_cents), 0)))),
-				),
-			);
-		});
-		put($("main"), 
-			h("div", { class: "row" }, field("Billable hours from", h("input", { type: "date", value: billPeriod.from, onchange: (e) => ((billPeriod.from = e.target.value), showBilling().catch(fail)) })), field("To", h("input", { type: "date", value: billPeriod.to, onchange: (e) => ((billPeriod.to = e.target.value), showBilling().catch(fail)) }))),
+					),
+				);
+			});
+
+		// Billed time entries
+		const unbillable = (t) => (t.billing_journal_entry_id === null ? "Billed before each time entry had its own transaction: reverse its whole billing below." : null);
+		const billedAll = edit && allBox(toUnbill, billed.filter((t) => !unbillable(t)).map((t) => t.id), redraw, "Choose all billed");
+		if (billedAll) boxes.push(billedAll);
+		const billedTable = billed.length
+			? table(
+					[edit ? " " : "", "Date", "Employee", "Customer", "What", "#Hours", "#Amount", "Billed", ""],
+					billed.map((t) =>
+						h(
+							"tr",
+							{},
+							h("td", { class: "pick" }, edit && pickBox(toUnbill, t.id, redraw, unbillable(t))),
+							h("td", { style: "white-space: nowrap" }, t.work_date),
+							h("td", {}, t.employee_name),
+							h("td", {}, t.customer_entity_id === null ? "" : name(String(t.customer_entity_id))),
+							h("td", {}, t.description),
+							h("td", { class: "n" }, hrs(t.minutes)),
+							h("td", { class: "n" }, money(t.amount_cents)),
+							h("td", {}, chip("Billed", "ok")),
+							h("td", { style: "white-space: nowrap" }, journalLink(t.billing_journal_entry_id)),
+						),
+					),
+				)
+			: empty("No billed time in this period.");
+
+		put(
+			$("main"),
+			h("div", { class: "row" }, field("Time from", h("input", { type: "date", value: billPeriod.from, onchange: (e) => ((billPeriod.from = e.target.value), showBilling().catch(fail)) })), field("To", h("input", { type: "date", value: billPeriod.to, onchange: (e) => ((billPeriod.to = e.target.value), showBilling().catch(fail)) }))),
+			h("h2", {}, "To bill"),
+			edit && open.length > 0 && billBar,
 			cards.length ? cards : empty("No unbilled billable hours in this period. Mark time as billable on the Time tab (or in timesheet.io)."),
-			h("h2", {}, "Billed"),
+			h("h2", { class: "pickhead" }, billedAll, "Billed time"),
+			edit && billed.length > 0 && unbillBar,
+			billedTable,
+			h("h2", {}, "Billings"),
+			h("p", { class: "muted" }, "Each billing is one customer's time from one batch."),
 			done.length === 0
 				? empty("Nothing billed yet.")
 				: table(
@@ -565,12 +686,13 @@
 									{ style: "white-space: nowrap" },
 									h("button", { class: "plain small", onclick: act(() => openBilling(b.id)) }, "Open"),
 									" ",
-									canEdit() && b.status === "posted" && h("button", { class: "danger small", onclick: act(async () => confirm(`Reverse billing ${b.id} for ${b.customer_name}? Its journal entry is reversed and the hours become billable again.`) && (await send("POST", `/billings/${b.id}/reverse`), await reload())) }, "Reverse"),
+									edit && b.status === "posted" && h("button", { class: "danger small", onclick: act(async () => confirm(`Reverse billing ${b.id} for ${b.customer_name}? Its transactions are reversed and the hours become billable again.`) && (await send("POST", `/billings/${b.id}/reverse`), await reload())) }, "Reverse"),
 								),
 							),
 						),
 					),
 		);
+		redraw();
 	}
 
 	// ---- Payroll ----------------------------------------------------------------

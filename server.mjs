@@ -196,7 +196,7 @@ export default async function register(ctx) {
 	// What an hour of this entry is charged at: its own rate, else the project's, else the employee's.
 	const RATE = `COALESCE(t.bill_rate_cents, p.bill_rate_cents, e.bill_rate_cents, 0)`;
 	const TIME = `t.id, t.employee_id, e.name AS employee_name, t.project_id, p.name AS project_name, p.customer_entity_id, t.work_date, t.minutes,
-		t.description, t.billable, t.bill_rate_cents, t.source, t.billing_id, t.pay_run_id, t.push_status, t.push_error, t.timesheet_task_id IS NOT NULL AS in_timesheet,
+		t.description, t.billable, t.bill_rate_cents, t.source, t.billing_id, t.pay_run_id, t.push_status, t.push_error, t.timesheet_task_id IS NOT NULL AS in_timesheet, t.billing_journal_entry_id,
 		COALESCE(t.billed_rate_cents, ${RATE}) AS rate_cents,
 		COALESCE(t.billed_amount_cents, round(t.minutes * ${RATE} / 60.0)::bigint) AS amount_cents
 		FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id LEFT JOIN ${S}.projects p ON p.id = t.project_id`;
@@ -214,6 +214,7 @@ export default async function register(ctx) {
 		if (g("employee_id")) add("t.employee_id = ?", idOf(g("employee_id"), "employee"));
 		if (g("show") === "billable") where.push("t.billable AND t.billing_id IS NULL");
 		if (g("show") === "unpaid") where.push("t.pay_run_id IS NULL");
+		if (g("show") === "billed") where.push("t.billing_id IS NOT NULL");
 		const { rows } = await q(`SELECT ${TIME} ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY t.work_date DESC, t.id DESC LIMIT 1000`, params);
 		return { data: rows };
 	});
@@ -309,13 +310,41 @@ export default async function register(ctx) {
 		if (entry.timesheet_task_id) pushSoon(req);
 	});
 
-	// ---- billings: bill a customer for billable hours -----------------------------
+	// ---- billings: bill customers for billable hours ---------------------------------
+	// Each billed time entry posts its own journal entry: debit accounts receivable, credit the
+	// billable hours account, with the customer as the entry's entity. Other modules find it by its
+	// tag, a link on the entry with ref "billed" (label "Billed"), and by the customer on it.
+	const BILLED_TAG = { ref: "billed", label: "Billed" };
 	const BILL = `id, customer_entity_id, customer_name, period_start, period_end, billing_date, currency, total_minutes, total_cents, status, journal_entry_id, created_by, created_at, reversed_by, reversed_at`;
-	const releaseBilling = (id, drop) =>
+	const idList = (v, name) => {
+		if (!Array.isArray(v) || v.length === 0) throw bad(`choose at least one ${name}`);
+		if (v.length > 2000) throw bad(`choose at most 2000 ${name}s at a time`);
+		return [...new Set(v.map((x) => idOf(x, name)))];
+	};
+	const billingHref = (id) => `/apps/employees?billing=${id}`;
+
+	/** Frees time entries from their billing: they are billable again (and timesheet.io is told). */
+	const unclaim = (ids) =>
 		q(
-			`WITH freed AS (UPDATE ${S}.time_entries SET billing_id = NULL, billed_rate_cents = NULL, billed_amount_cents = NULL, push_status = 'pending', push_error = '', updated_at = now() WHERE billing_id = $1 RETURNING 1)
-			${drop ? `DELETE FROM ${S}.billings WHERE id = $1` : `SELECT count(*) FROM freed`}`,
-			[id],
+			`UPDATE ${S}.time_entries SET billing_id = NULL, billed_rate_cents = NULL, billed_amount_cents = NULL, billing_journal_entry_id = NULL,
+				push_status = 'pending', push_error = '', updated_at = now()
+			WHERE id = ANY($1::bigint[])`,
+			[ids],
+		);
+
+	/** A billing's totals from the time entries still on it; one with none left is reversed. */
+	const retotal = (billingId, who) =>
+		q(
+			`UPDATE ${S}.billings b SET
+				total_minutes = CASE WHEN x.n > 0 THEN x.minutes ELSE b.total_minutes END,
+				total_cents = CASE WHEN x.n > 0 THEN x.cents ELSE b.total_cents END,
+				status = CASE WHEN x.n = 0 THEN 'reversed' ELSE b.status END,
+				reversed_by = CASE WHEN x.n = 0 THEN COALESCE(b.reversed_by, $2) ELSE b.reversed_by END,
+				reversed_at = CASE WHEN x.n = 0 THEN COALESCE(b.reversed_at, now()) ELSE b.reversed_at END
+			FROM (SELECT count(*)::int AS n, COALESCE(sum(minutes), 0)::int AS minutes, COALESCE(sum(billed_amount_cents), 0)::bigint AS cents
+				FROM ${S}.time_entries WHERE billing_id = $1) x
+			WHERE b.id = $1`,
+			[billingId, who],
 		);
 
 	/** A posting the server didn't finish (it stopped half-way): keep it if its entry exists, else undo it. */
@@ -328,8 +357,157 @@ export default async function register(ctx) {
 		}
 	}
 
+	/** A batch the server didn't finish: time entries whose journal entry exists keep it, the rest are billable again. */
+	async function settleBillings() {
+		const { rows } = await q(`SELECT id FROM ${S}.billings WHERE status = 'posting' AND created_at < now() - interval '2 minutes'`);
+		for (const r of rows) {
+			const lost = [];
+			for (const t of (await q(`SELECT id FROM ${S}.time_entries WHERE billing_id = $1 AND billing_journal_entry_id IS NULL`, [r.id])).rows) {
+				const linked = (await ctx.ledger.linkedEntries(`time:${t.id}`)).find((l) => !l.reversed);
+				if (linked) await q(`UPDATE ${S}.time_entries SET billing_journal_entry_id = $2 WHERE id = $1`, [t.id, linked.entry_id]);
+				else lost.push(t.id);
+			}
+			if (lost.length) await unclaim(lost);
+			const { rows: left } = await q(`SELECT count(*)::int AS n FROM ${S}.time_entries WHERE billing_id = $1`, [r.id]);
+			if (left[0].n === 0) await q(`DELETE FROM ${S}.billings WHERE id = $1 AND status = 'posting'`, [r.id]);
+			else {
+				await q(`UPDATE ${S}.billings SET status = 'posted' WHERE id = $1 AND status = 'posting'`, [r.id]);
+				await retotal(r.id, "recovery");
+			}
+		}
+	}
+
+	/**
+	 * Bills time entries: one billing per customer, one journal entry per time entry.
+	 * → { billings, billed, total_cents, skipped: [{ id, reason }] }. Throws only when nothing could be billed.
+	 */
+	async function billEntries(ids, { billingDate, acc, currency, user }) {
+		const { rows } = await q(
+			`SELECT t.id, t.work_date, t.minutes, t.description, t.billable, t.billing_id, e.name AS employee_name, p.name AS project_name, p.customer_entity_id,
+				${RATE} AS rate, round(t.minutes * ${RATE} / 60.0)::bigint AS amount
+			FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id LEFT JOIN ${S}.projects p ON p.id = t.project_id
+			WHERE t.id = ANY($1::bigint[]) ORDER BY t.work_date, t.id`,
+			[ids],
+		);
+		const skipped = [];
+		const found = new Set(rows.map((r) => String(r.id)));
+		for (const id of ids) if (!found.has(String(id))) skipped.push({ id: Number(id), reason: "no such time entry" });
+		const byCustomer = new Map();
+		for (const r of rows) {
+			const reason =
+				r.billing_id !== null ? "already billed"
+				: !r.billable ? "not billable"
+				: r.customer_entity_id === null ? (r.project_name ? `the project ${r.project_name} has no customer` : "no project, so no customer")
+				: r.rate <= 0n ? "no billing rate"
+				: r.amount <= 0n ? "its amount rounds to 0.00"
+				: null;
+			if (reason) skipped.push({ id: Number(r.id), reason });
+			else {
+				const key = String(r.customer_entity_id);
+				if (!byCustomer.has(key)) byCustomer.set(key, []);
+				byCustomer.get(key).push(r);
+			}
+		}
+
+		const billings = [];
+		let billed = 0;
+		let total = 0n;
+		let failure = null;
+		for (const [customerId, list] of byCustomer) {
+			if (failure) {
+				for (const r of list) skipped.push({ id: Number(r.id), reason: `not billed: ${failure.message}` });
+				continue;
+			}
+			let entity;
+			try {
+				entity = await ctx.entities.get(Number(customerId));
+			} catch {
+				for (const r of list) skipped.push({ id: Number(r.id), reason: "its customer isn't in Ledger's entity list any more" });
+				continue;
+			}
+			const dates = list.map((r) => r.work_date).sort();
+			const { rows: made } = await q(
+				`INSERT INTO ${S}.billings (customer_entity_id, customer_name, period_start, period_end, billing_date, currency, created_by)
+				VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+				[entity.id, entity.name, dates[0], dates[dates.length - 1], billingDate, currency, user.username],
+			);
+			const billingId = made[0].id;
+			// Claimed in one statement, so a second batch can't bill the same time twice.
+			const { rows: claimed } = await q(
+				`UPDATE ${S}.time_entries t
+				SET billing_id = $2, billed_rate_cents = r.rate, billed_amount_cents = round(t.minutes * r.rate / 60.0)::bigint, push_status = 'pending', push_error = '', updated_at = now()
+				FROM ${S}.time_entries t2
+				JOIN ${S}.employees e ON e.id = t2.employee_id
+				JOIN ${S}.projects p ON p.id = t2.project_id
+				CROSS JOIN LATERAL (SELECT COALESCE(t2.bill_rate_cents, p.bill_rate_cents, e.bill_rate_cents, 0) AS rate) r
+				WHERE t2.id = t.id AND t.id = ANY($1::bigint[]) AND p.customer_entity_id = $3 AND t.billable AND t.billing_id IS NULL AND r.rate > 0
+				RETURNING t.id, t.minutes, t.billed_amount_cents AS amount`,
+				[list.map((r) => r.id), billingId, entity.id],
+			);
+			const info = new Map(list.map((r) => [String(r.id), r]));
+			for (const r of list) if (!claimed.some((c) => String(c.id) === String(r.id))) skipped.push({ id: Number(r.id), reason: "billed or changed by someone else meanwhile" });
+			const posted = [];
+			for (let i = 0; i < claimed.length; i++) {
+				const c = claimed[i];
+				const t = info.get(String(c.id));
+				try {
+					const entry = await ctx.ledger.createJournalEntry(
+						{
+							entry_date: billingDate,
+							description: `Billable hours: ${entity.name} · ${t.employee_name} · ${t.work_date} (${hours(c.minutes)} h)`.slice(0, 500),
+							reference: `HOURS-${c.id}`,
+							entity_id: entity.id,
+							lines: [
+								{ account_code: acc.receivable_account, debit_cents: c.amount },
+								{ account_code: acc.revenue_account, credit_cents: c.amount, memo: [t.project_name, t.description].filter(Boolean).join(": ").slice(0, 500) || undefined },
+							],
+							links: [
+								{ ref: `time:${c.id}`, label: `Hours ${t.work_date} · ${t.employee_name} · ${hours(c.minutes)} h`.slice(0, 200), href: billingHref(billingId) },
+								{ ...BILLED_TAG, href: billingHref(billingId) },
+							],
+						},
+						user,
+					);
+					await q(`UPDATE ${S}.time_entries SET billing_journal_entry_id = $2 WHERE id = $1`, [c.id, entry.id]);
+					posted.push(c);
+				} catch (e) {
+					// Stop here (the same accounts would fail again); the rest become billable again.
+					failure = e;
+					const rest = claimed.slice(i).map((x) => x.id);
+					await unclaim(rest);
+					for (const id of rest) skipped.push({ id: Number(id), reason: `not billed: ${e?.message ?? e}` });
+					break;
+				}
+			}
+			if (posted.length === 0) {
+				await q(`DELETE FROM ${S}.billings WHERE id = $1`, [billingId]);
+				continue;
+			}
+			await q(`UPDATE ${S}.billings SET status = 'posted' WHERE id = $1`, [billingId]);
+			await retotal(billingId, user.username);
+			billings.push((await q(`SELECT ${BILL} FROM ${S}.billings WHERE id = $1`, [billingId])).rows[0]);
+			billed += posted.length;
+			total += posted.reduce((a, c) => a + BigInt(c.amount), 0n);
+		}
+		if (billed === 0) {
+			if (failure) throw failure;
+			const reasons = [...new Set(skipped.map((s) => s.reason))].slice(0, 3).join("; ");
+			throw bad(`Nothing to bill: ${reasons || "no time chosen"}.`);
+		}
+		return { billings, billed, total_cents: total, skipped };
+	}
+
+	async function billingSetup(b) {
+		const settings = await ctx.settings.get();
+		return {
+			billingDate: b.billing_date === undefined ? today() : reqDate(b.billing_date, "billing date"),
+			acc: await pickAccounts(b, settings, { receivable_account: "accounts receivable account", revenue_account: "billable hours account" }),
+			currency: currencyOf(settings),
+		};
+	}
+
 	ctx.route("GET", "/billings", async () => {
-		await settle("billings", "billing", (id) => releaseBilling(id, true));
+		await settleBillings();
 		const { rows } = await q(`SELECT ${BILL} FROM ${S}.billings ORDER BY id DESC LIMIT 200`);
 		return { data: rows };
 	});
@@ -342,68 +520,51 @@ export default async function register(ctx) {
 		return { ...rows[0], lines: lines.rows };
 	});
 
+	// Bill one customer's unbilled billable hours in a period.
 	ctx.route("POST", "/billings", async (req) => {
 		const b = body(req);
 		const entity = await customer(idOf(b.customer_entity_id, "customer"));
 		const from = reqDate(b.period_start, "from");
 		const to = reqDate(b.period_end, "to");
 		if (to < from) throw bad("the period ends before it starts");
-		const billingDate = b.billing_date === undefined ? today() : reqDate(b.billing_date, "billing date");
-		const settings = await ctx.settings.get();
-		const acc = await pickAccounts(b, settings, { receivable_account: "accounts receivable account", revenue_account: "revenue account" });
-		const currency = currencyOf(settings);
-
+		const setup = await billingSetup(b);
 		const { rows } = await q(
-			`WITH b AS (
-				INSERT INTO ${S}.billings (customer_entity_id, customer_name, period_start, period_end, billing_date, currency, created_by)
-				VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
-			), claimed AS (
-				UPDATE ${S}.time_entries t
-				SET billing_id = (SELECT id FROM b), billed_rate_cents = r.rate, billed_amount_cents = round(t.minutes * r.rate / 60.0)::bigint, push_status = 'pending', push_error = '', updated_at = now()
-				FROM ${S}.time_entries t2
-				JOIN ${S}.employees e ON e.id = t2.employee_id
-				JOIN ${S}.projects p ON p.id = t2.project_id
-				CROSS JOIN LATERAL (SELECT COALESCE(t2.bill_rate_cents, p.bill_rate_cents, e.bill_rate_cents, 0) AS rate) r
-				WHERE t2.id = t.id AND p.customer_entity_id = $1 AND t.billable AND t.billing_id IS NULL AND t.work_date BETWEEN $3 AND $4 AND r.rate > 0
-				RETURNING t.minutes, t.billed_amount_cents
-			)
-			SELECT (SELECT id FROM b) AS id, count(*)::int AS entries, COALESCE(sum(minutes), 0)::int AS minutes, COALESCE(sum(billed_amount_cents), 0)::bigint AS total FROM claimed`,
-			[entity.id, entity.name, from, to, billingDate, currency, req.user.username],
+			`SELECT t.id FROM ${S}.time_entries t JOIN ${S}.projects p ON p.id = t.project_id
+			WHERE p.customer_entity_id = $1 AND t.billable AND t.billing_id IS NULL AND t.work_date BETWEEN $2 AND $3`,
+			[entity.id, from, to],
 		);
-		const made = rows[0];
-		if (made.entries === 0 || made.total <= 0n) {
-			await releaseBilling(made.id, true);
-			throw bad(`${entity.name} has no unbilled billable hours with a billing rate from ${from} to ${to}.`);
-		}
-		let entry;
-		try {
-			entry = await ctx.ledger.createJournalEntry(
-				{
-					entry_date: billingDate,
-					description: `Billable hours: ${entity.name}, ${from} to ${to} (${hours(made.minutes)} h)`,
-					reference: `HOURS-${made.id}`,
-					entity_id: entity.id,
-					lines: [
-						{ account_code: acc.receivable_account, debit_cents: made.total },
-						{ account_code: acc.revenue_account, credit_cents: made.total },
-					],
-					links: [{ ref: `billing:${made.id}`, label: `Billed hours ${made.id} · ${entity.name}`.slice(0, 200), href: `/apps/employees?billing=${made.id}` }],
-				},
-				req.user,
-			);
-		} catch (e) {
-			await releaseBilling(made.id, true);
-			throw e;
-		}
-		const done = await q(`UPDATE ${S}.billings SET status = 'posted', journal_entry_id = $2, total_minutes = $3, total_cents = $4 WHERE id = $1 RETURNING ${BILL}`, [
-			made.id,
-			entry.id,
-			made.minutes,
-			made.total,
-		]);
+		if (rows.length === 0) throw bad(`${entity.name} has no unbilled billable hours from ${from} to ${to}.`);
+		const r = await billEntries(rows.map((x) => x.id), { ...setup, user: req.user });
 		pushSoon(req);
-		return ctx.response(201, done.rows[0]);
+		return ctx.response(201, { ...r.billings[0], skipped: r.skipped });
 	});
+
+	// Batch: bill the chosen time entries, for any number of customers.
+	ctx.route("POST", "/billings/batch", async (req) => {
+		const b = body(req);
+		const ids = idList(b.entry_ids, "time entry");
+		const r = await billEntries(ids, { ...(await billingSetup(b)), user: req.user });
+		pushSoon(req);
+		return ctx.response(201, r);
+	});
+
+	/** Billed time entries with their own journal entry; the others are skipped with a reason. */
+	async function billedEntries(ids) {
+		const { rows } = await q(
+			`SELECT t.id, t.billing_id, t.billing_journal_entry_id FROM ${S}.time_entries t WHERE t.id = ANY($1::bigint[])`,
+			[ids],
+		);
+		const skipped = [];
+		const ok = [];
+		const found = new Set(rows.map((r) => String(r.id)));
+		for (const id of ids) if (!found.has(String(id))) skipped.push({ id: Number(id), reason: "no such time entry" });
+		for (const r of rows) {
+			if (r.billing_id === null) skipped.push({ id: Number(r.id), reason: "not billed" });
+			else if (r.billing_journal_entry_id === null) skipped.push({ id: Number(r.id), reason: "billed before each time entry had its own transaction: reverse its whole billing instead" });
+			else ok.push(r);
+		}
+		return { ok, skipped };
+	}
 
 	/** Reverses a record's journal entry unless it already is (or a restore left none). */
 	async function reverseEntryOf(entryId, description, user) {
@@ -417,14 +578,43 @@ export default async function register(ctx) {
 		if (entry.reversed_by_id === null) await ctx.ledger.reverseJournalEntry(entryId, { description }, user);
 	}
 
+	/** Reverses billed time entries' own journal entries and drops their Billed tag; the time is billable again. */
+	async function unbill(rows, user) {
+		const billingIds = new Set();
+		const done = [];
+		for (const r of rows) {
+			if (r.billing_journal_entry_id !== null) {
+				await reverseEntryOf(r.billing_journal_entry_id, `Reversal: billable hours (time entry ${r.id})`, user);
+				await ctx.ledger.unlinkJournalEntry(r.billing_journal_entry_id, BILLED_TAG.ref).catch(() => false);
+			}
+			done.push(r.id);
+			billingIds.add(String(r.billing_id));
+		}
+		if (done.length) await unclaim(done);
+		for (const id of billingIds) await retotal(id, user.username);
+		return done.length;
+	}
+
+	// Batch: unbill chosen time entries.
+	ctx.route("POST", "/billed/unbill", async (req) => {
+		const ids = idList(body(req).entry_ids, "time entry");
+		const { ok, skipped } = await billedEntries(ids);
+		if (ok.length === 0) throw bad(`Nothing to unbill: ${[...new Set(skipped.map((s) => s.reason))].slice(0, 3).join("; ")}.`);
+		const unbilled = await unbill(ok, req.user);
+		pushSoon(req);
+		return { unbilled, skipped };
+	});
+
 	ctx.route("POST", "/billings/:id/reverse", async (req) => {
 		const id = paramId(req, "billing");
 		const { rows } = await q(`SELECT ${BILL} FROM ${S}.billings WHERE id = $1`, [id]);
 		if (rows.length === 0) throw new ctx.HttpError(404, "no such billing");
 		if (rows[0].status !== "posted") throw new ctx.HttpError(409, `This billing is ${rows[0].status}, not posted.`);
+		// A billing from before 0.4.0 has one journal entry for all its time.
 		await reverseEntryOf(rows[0].journal_entry_id, `Reversal: billed hours ${id} · ${rows[0].customer_name}`, req.user);
-		await q(`UPDATE ${S}.billings SET status = 'reversed', reversed_by = $2, reversed_at = now() WHERE id = $1`, [id, req.user.username]);
-		await releaseBilling(id, false);
+		const { rows: entries } = await q(`SELECT id, billing_id, billing_journal_entry_id FROM ${S}.time_entries WHERE billing_id = $1`, [id]);
+		await unbill(entries, req.user);
+		await q(`UPDATE ${S}.billings SET status = 'reversed', reversed_by = COALESCE(reversed_by, $2), reversed_at = COALESCE(reversed_at, now()) WHERE id = $1`, [id, req.user.username]);
 		pushSoon(req);
 		return { id: rows[0].id, status: "reversed" };
 	});
@@ -1034,6 +1224,25 @@ export default async function register(ctx) {
 				}
 			})
 			.catch((e) => ctx.log.warn("timesheet.io sync failed", { error: String(e?.message ?? e) }));
+
+	// Billings made before 0.4.0 have one journal entry for the whole billing: tag it Billed too, so other
+	// modules find all billed hours the same way (the same ref again only updates the link).
+	setTimeout(() => {
+		ctx.orgs
+			.forEach(async () => {
+				const { rows } = await q(`SELECT id, journal_entry_id FROM ${S}.billings WHERE status = 'posted' AND journal_entry_id IS NOT NULL`);
+				for (const r of rows) {
+					try {
+						const entry = await ctx.ledger.getJournalEntry(r.journal_entry_id);
+						if (entry.reversed_by_id === null && !entry.links.some((l) => l.module_id === ctx.id && l.ref === BILLED_TAG.ref))
+							await ctx.ledger.linkJournalEntry(r.journal_entry_id, { ...BILLED_TAG, href: billingHref(r.id) });
+					} catch {
+						// the entry is gone (restored from elsewhere): nothing to tag
+					}
+				}
+			})
+			.catch((e) => ctx.log.warn("could not tag older billings", { error: String(e?.message ?? e) }));
+	}, 5_000).unref();
 
 	// Hourly pull from timesheet.io, in every organization that turned it on.
 	setInterval(() => pullInBackground("timesheet.io (hourly)", (_org, s) => s.timesheet_auto_sync === true), 3_600_000).unref();

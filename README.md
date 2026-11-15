@@ -14,10 +14,14 @@ newer). Install it under **Settings → Modules** by entering this repository's
 - **Calendar**: a month of hours worked per day, for everyone or one
   employee. Scroll up or down in it to move through the months; click a day
   to open its time entries.
-- **Billable hours**: unbilled billable hours grouped by customer. *Bill*
-  posts one journal entry (debit accounts receivable, credit revenue) tagged
-  with the customer, marks the hours billed and offers them as a CSV for the
-  invoice. A billing can be reversed, which makes the hours billable again.
+- **Billable hours**: unbilled billable hours grouped by customer. Tick time
+  entries (one by one, a whole customer, or across customers) and press
+  *Bill chosen*. **Each time entry posts its own transaction**: debit accounts
+  receivable, credit the billable hours account, with the customer on it and
+  tagged **Billed** (see *For other modules* below). Billed time can be ticked
+  and unbilled the same way, which reverses those transactions and makes the
+  hours billable again. A batch makes one billing per customer; a billing can
+  be opened (with a CSV of its lines for the invoice) or reversed as a whole.
 - **Payroll**: a pay run takes every hour in a period that isn't on a pay run
   yet (hourly employees) plus one period's pay for each salaried employee.
   You review the draft, correct gross pay, deductions and employer cost per
@@ -40,6 +44,24 @@ newer). Install it under **Settings → Modules** by entering this repository's
 **Payroll taxes are not calculated.** Deductions and the employer's share
 start as a percentage you set on each employee and are yours to correct on
 every pay run. Use your payroll provider's or tax authority's figures.
+
+## For other modules
+
+Every billed time entry is one journal entry, so another module (an invoicing
+module, say) can find billed hours without reading this module's tables:
+
+- list the entries of the billable hours account
+  (`ctx.ledger.listJournalEntries({ accountCode })`);
+- the customer is the entry's `entity` (`{ id, name }`);
+- the entry carries the tag link `{ module_id: "employees", ref: "billed",
+  label: "Billed" }`, plus `{ ref: "time:<id>" }` naming the time entry
+  (label: date, person and hours; it opens the billing here);
+- the reference is `HOURS-<time entry id>`, the credit line's memo is the
+  project and what was done.
+
+An unbilled entry is reversed (`reversed_by_id` is set) and loses its Billed
+tag. Billings made before 0.4.0 are one entry for the whole billing; they get
+the Billed tag too (when the module starts) and are linked as `billing:<id>`.
 
 ## timesheet.io
 
