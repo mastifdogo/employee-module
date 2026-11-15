@@ -1,7 +1,7 @@
 {
   "id": "employees",
   "name": "Employees",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Track employee time, bill customers for billable hours and run payroll, with time pulled from timesheet.io.",
   "ledger": ">=0.19.8",
   "server": "server.mjs",
@@ -16,7 +16,7 @@
   "settings": {
     "tabs": [
       { "id": "payroll", "label": "Payroll", "help": "The currency everything is in, and the accounts pay runs are posted to. Each can also be chosen when posting." },
-      { "id": "billing", "label": "Billing hours", "help": "The accounts billed time is posted to, for Sales to invoice." },
+      { "id": "billing", "label": "Billing hours", "help": "The account billed time is recorded in, for Sales to invoice." },
       { "id": "timesheet", "label": "timesheet.io", "help": "Keeps Ledger's time entries and timesheet.io's tasks the same, both ways.", "page": "settings.html" }
     ],
     "fields": [
@@ -24,8 +24,7 @@
       { "key": "wages_expense_account", "label": "Wages expense", "type": "account", "account_types": ["expense"], "help": "Debited with gross pay when a pay run is posted." },
       { "key": "employer_cost_account", "label": "Employer payroll costs", "type": "account", "account_types": ["expense"], "help": "The employer's share: pension, insurance, payroll taxes." },
       { "key": "payroll_liabilities_account", "label": "Payroll liabilities", "type": "account", "account_types": ["liability"], "help": "Credited with amounts withheld from pay and the employer's share, until they are remitted." },
-      { "key": "billable_hours_account", "label": "Billable hours", "type": "account", "tab": "billing", "help": "Debited for each billed time entry, with the customer on it. Sales invoices from this account." },
-      { "key": "revenue_account", "label": "Revenue", "type": "account", "tab": "billing", "account_types": ["revenue"], "help": "Credited for each billed time entry." },
+      { "key": "billable_hours_account", "label": "Billable hours", "type": "account", "tab": "billing", "help": "Made by this module the first time hours are billed. Each billed time entry is recorded here with the customer on it, as a debit and an equal credit, so nothing is revenue until the hours are invoiced. Add it under Settings → Sales → Billable items." },
       { "key": "timesheet_api_key", "label": "API key", "type": "secret", "tab": "timesheet", "help": "Create one at my.timesheet.io → Development → API keys. It looks like ts_xxxx.yyyy." },
       { "key": "timesheet_time_zone", "label": "Time zone", "type": "text", "tab": "timesheet", "default": "", "help": "For time entered in Ledger, which starts at 9:00 there, e.g. America/Toronto. Empty: UTC." },
       { "key": "timesheet_sync_days", "label": "Days to pull", "type": "number", "tab": "timesheet", "min": 1, "max": 730, "default": 60, "help": "Each sync re-reads this many days back, so edits made in timesheet.io are picked up." },

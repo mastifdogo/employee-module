@@ -16,9 +16,10 @@ newer). Install it under **Settings → Modules** by entering this repository's
   to open its time entries.
 - **Billable hours**: unbilled billable hours grouped by customer. Tick time
   entries (one by one, a whole customer, or across customers) and press
-  *Bill chosen*. **Each time entry posts its own transaction**: debit the
-  billable hours account, credit revenue, with the customer on it and tagged
-  **Billed**. Sales picks these up as billable items (see *Invoicing billed
+  *Bill chosen*. **Each time entry posts its own transaction in the
+  *Billable hours* account** the module creates, with the customer on it and
+  tagged **Billed**. Nothing is posted to revenue: that happens when the hours
+  are invoiced. Sales picks them up as billable items (see *Invoicing billed
   hours* below). Billed time can be ticked
   and unbilled the same way, which reverses those transactions and makes the
   hours billable again. A batch makes one billing per customer; a billing can
@@ -48,18 +49,20 @@ every pay run. Use your payroll provider's or tax authority's figures.
 
 ## Invoicing billed hours
 
-Every billed time entry is one journal entry: a **debit to the billable hours
-account** (Settings → Employees → Billing hours) and a credit to revenue, with the customer as
-the entry's entity. In the **Sales** module:
+The first time hours are billed, the module creates an asset account named
+**Billable hours** (code 1250, or the next free code) and writes its code under
+Settings → Employees → Billing hours. Every billed time entry is one journal entry in that
+account, with the customer as the entry's entity: a **debit** (the billable
+item) and an **equal credit**. So the account's balance stays 0 and **nothing
+is revenue until the hours are invoiced**. In the **Sales** module:
 
 1. Under **Settings → Sales**, add the billable hours account as one of the
    *Billable items* accounts.
 2. On a customer's new invoice, **+ Billable items** lists their billed hours,
    one per time entry (date, person, hours × rate, project and task); tick
    them and add them as one line or each as its own line.
-3. Give those invoice lines a category whose account is the **billable hours
-   account**. The invoice then moves the hours from unbilled to receivable;
-   the revenue was already counted when they were billed here.
+3. Give those invoice lines your usual revenue category: the invoice posts
+   the revenue (and the receivable) then.
 
 Any other module finds billed hours the same way, without reading this
 module's tables:
@@ -71,11 +74,12 @@ module's tables:
 - the entry carries the tag link `{ module_id: "employees", ref: "billed",
   label: "Billed" }`, plus `{ ref: "time:<id>" }` naming the time entry
   (label: date, person and hours; it opens the billing here);
-- the reference is `HOURS-<time entry id>`; both lines' memo is the item:
-  `2026-11-12 · Ana Silva · 7.00 h × 120.00 · Website rebuild: Task t2`.
+- the reference is `HOURS-<time entry id>`; the debit line's memo is the
+  item: `2026-11-12 · Ana Silva · 7.00 h × 120.00 · Website rebuild: Task t2`
+  (the credit line's is "Offset: revenue only once invoiced").
 
-Billings made in 0.4.0 debited accounts receivable instead; they stay as
-posted (unbilling one reverses it as usual).
+Billings made in 0.4.0 and 0.5.0 posted to revenue (and 0.4.0 to accounts
+receivable); they stay as posted. Unbilling one reverses it as usual.
 
 An unbilled entry is reversed (`reversed_by_id` is set) and loses its Billed
 tag. Billings made before 0.4.0 are one entry for the whole billing; they get
@@ -142,12 +146,13 @@ that job.
 
 - **Payroll**: the currency (CAD or USD) for all rates, billings and pay
   runs, and the three accounts pay runs are posted to.
-- **Billing hours**: the billable hours account and the revenue account.
+- **Billing hours**: the Billable hours account, filled in by the module
+  when it creates the account the first time hours are billed.
 - **timesheet.io**: the API key, time zone, days to pull, when to sync (on
   sign-in, hourly), and the connection's status with Sync now.
 
-Each account can also be picked, or created, in the dialog that posts, and
-the first choice is remembered.
+Each payroll account can also be picked, or created, in the dialog that
+posts, and the first choice is remembered.
 
 Rates: an hour is billed at the entry's own rate if it has one, else the
 project's, else the employee's.

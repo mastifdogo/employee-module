@@ -31,7 +31,7 @@ const salesItems = async (entityId, code = "1250") => {
 };
 const entryBy = async (pred, qs = "from=2000-01-01") => (await ok(m("GET", `/time?${qs}`))).data.find(pred);
 
-for (const [code, name, type, kind] of [["1000", "Chequing", "asset", "chequing"], ["1200", "Accounts receivable", "asset"], ["1250", "Unbilled billable hours", "asset"], ["2300", "Payroll liabilities", "liability"], ["4100", "Service revenue", "revenue"], ["5200", "Wages", "expense"], ["5210", "Employer payroll costs", "expense"]]) {
+for (const [code, name, type, kind] of [["1000", "Chequing", "asset", "chequing"], ["1200", "Accounts receivable", "asset"], ["2300", "Payroll liabilities", "liability"], ["4100", "Service revenue", "revenue"], ["5200", "Wages", "expense"], ["5210", "Employer payroll costs", "expense"]]) {
 	const r = await call("POST", "/api/v1/accounts", { code, name, type, currency: "CAD", ...(kind ? { kind } : {}) });
 	assert.ok(r.status === 201 || r.status === 409, JSON.stringify(r.body));
 }
@@ -115,8 +115,8 @@ assert.equal(made.user, "u-ben");
 step("hand-entered time sent to timesheet.io (and moved between people)");
 
 // Billing
-await ok(m("POST", "/billings", { customer_entity_id: acme.id, period_start: day(30), period_end: day(0) }), 422); // no accounts chosen yet
-const bill = await ok(m("POST", "/billings", { customer_entity_id: acme.id, period_start: day(30), period_end: day(0), billable_hours_account: "1250", revenue_account: "4100" }), 201);
+await ok(call("GET", "/api/v1/accounts/1250"), 404); // no Billable hours account yet: billing makes it
+const bill = await ok(m("POST", "/billings", { customer_entity_id: acme.id, period_start: day(30), period_end: day(0) }), 201);
 assert.equal(bill.total_minutes, 180 + 420 + 120);
 assert.equal(bill.total_cents, 12 * 12000);
 assert.equal(bill.status, "posted");
@@ -125,7 +125,11 @@ const billedT2 = await entryBy((t) => t.id === t2.id);
 assert.ok(billedT2.billing_journal_entry_id);
 const entry = await ok(call("GET", `/api/v1/journal-entries/${billedT2.billing_journal_entry_id}`));
 assert.equal(entry.entity?.name, "Acme Corp");
-assert.deepEqual(entry.lines.map((l) => [l.account_code, Number(l.debit_cents), Number(l.credit_cents)]), [["1250", 84000, 0], ["4100", 0, 84000]]); // 7 h at 120.00
+assert.deepEqual(entry.lines.map((l) => [l.account_code, Number(l.debit_cents), Number(l.credit_cents)]), [["1250", 84000, 0], ["1250", 0, 84000]]); // 7 h at 120.00, debit and offset in Billable hours
+const billAcct = await ok(call("GET", "/api/v1/accounts/1250"));
+assert.deepEqual([billAcct.name, billAcct.type, billAcct.currency, Number(billAcct.balance_cents)], ["Billable hours", "asset", "CAD", 0]);
+assert.equal(Number((await ok(call("GET", "/api/v1/accounts/4100"))).balance_cents), 0); // nothing is revenue yet
+assert.equal((await ok(call("GET", "/api/v1/modules/employees/settings"))).values.billable_hours_account, "1250");
 assert.equal(entry.lines[0].memo, `${day(2)} · Ana S. · 7.00 h × 120.00 · Website rebuild: Edited in Ledger`);
 const acmeItems = await salesItems(acme.id);
 assert.deepEqual(acmeItems.map((i) => i.cents).sort(), [24000, 36000, 84000]); // one item per time entry, for Sales to invoice

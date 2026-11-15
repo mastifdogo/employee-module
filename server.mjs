@@ -311,9 +311,10 @@ export default async function register(ctx) {
 	});
 
 	// ---- billings: bill customers for billable hours ---------------------------------
-	// Each billed time entry posts its own journal entry: debit the billable hours account (with the
-	// details in the line's memo), credit revenue, with the customer as the entry's entity. An invoicing
-	// module picks those debits up as the customer's billable items (Sales: Settings → Sales → Billable
+	// Each billed time entry posts its own journal entry in the Billable hours account this module
+	// creates: a debit (the item, details in its memo) and a credit of the same amount, with the
+	// customer as the entry's entity. Nothing reaches revenue until the hours are invoiced. An invoicing
+	// module picks the debits up as the customer's billable items (Sales: Settings → Sales → Billable
 	// items accounts); it also finds them by the link with ref "billed" (label "Billed").
 	const BILLED_TAG = { ref: "billed", label: "Billed" };
 	const BILL = `id, customer_entity_id, customer_name, period_start, period_end, billing_date, currency, total_minutes, total_cents, status, journal_entry_id, created_by, created_at, reversed_by, reversed_at`;
@@ -459,9 +460,10 @@ export default async function register(ctx) {
 							reference: `HOURS-${c.id}`,
 							entity_id: entity.id,
 							lines: [
-								// What an invoice line shows for this item: the line's memo.
+								// The debit is the billable item (an invoice line shows its memo); the credit offsets it
+								// in the same account, so the books don't change until the hours are invoiced.
 								{ account_code: acc.billable_hours_account, debit_cents: c.amount, memo: itemMemo(t, c) },
-								{ account_code: acc.revenue_account, credit_cents: c.amount, memo: itemMemo(t, c) },
+								{ account_code: acc.billable_hours_account, credit_cents: c.amount, memo: "Offset: revenue only once invoiced" },
 							],
 							links: [
 								{ ref: `time:${c.id}`, label: `Hours ${t.work_date} · ${t.employee_name} · ${hours(c.minutes)} h`.slice(0, 200), href: billingHref(billingId) },
@@ -504,12 +506,31 @@ export default async function register(ctx) {
 	const itemMemo = (t, c) =>
 		[t.work_date, t.employee_name, `${hours(c.minutes)} h × ${money2(t.rate)}`, [t.project_name, t.description].filter(Boolean).join(": ")].filter(Boolean).join(" · ").slice(0, 500);
 
+	const BILLABLE_ACCOUNT = { name: "Billable hours", type: "asset", description: "Made by the Employees module. Each billed time entry is a debit (the billable item, with the customer on the entry) and an equal credit here, so the balance stays 0 and nothing is revenue until the hours are invoiced. Add this account under Settings → Sales → Billable items." };
+
+	/** The Billable hours account: the one in Settings → Employees if it exists in this currency, else one this module creates. */
+	async function billableAccount(currency) {
+		const settings = await ctx.settings.get();
+		const all = await ctx.ledger.listAccounts({ includeInactive: true });
+		const set = typeof settings.billable_hours_account === "string" ? settings.billable_hours_account.trim() : "";
+		const have = all.find((a) => a.code === set);
+		if (have && have.is_active && have.currency === currency) return have.code;
+		const taken = new Set(all.map((a) => a.code));
+		const code = [...Array.from({ length: 50 }, (_, i) => String(1250 + i)), "BILLHRS", `BILLHRS-${currency}`].find((c) => !taken.has(c));
+		if (!code) throw new ctx.HttpError(409, "Couldn't find a free account code for Billable hours: choose one under Settings → Employees → Billing hours.");
+		const made = await ctx.ledger.createAccount({ ...BILLABLE_ACCOUNT, code, currency });
+		await ctx.settings.set({ billable_hours_account: made.code });
+		ctx.log.info("created the Billable hours account", { code: made.code, replaced: set || null });
+		return made.code;
+	}
+
 	async function billingSetup(b) {
 		const settings = await ctx.settings.get();
+		const currency = currencyOf(settings);
 		return {
 			billingDate: b.billing_date === undefined ? today() : reqDate(b.billing_date, "billing date"),
-			acc: await pickAccounts(b, settings, { billable_hours_account: "billable hours account", revenue_account: "revenue account for billed hours" }),
-			currency: currencyOf(settings),
+			acc: { billable_hours_account: await billableAccount(currency) },
+			currency,
 		};
 	}
 
@@ -1136,7 +1157,7 @@ export default async function register(ctx) {
 			...rows[0],
 			role: req.user.role,
 			currency: currencyOf(s),
-			accounts: Object.fromEntries(["wages_expense_account", "employer_cost_account", "payroll_liabilities_account", "billable_hours_account", "revenue_account"].map((k) => [k, s[k] || null])),
+			accounts: Object.fromEntries(["wages_expense_account", "employer_cost_account", "payroll_liabilities_account", "billable_hours_account"].map((k) => [k, s[k] || null])),
 			timesheet: { configured: Boolean(s.timesheet_api_key), auto_sync: s.timesheet_auto_sync === true, last_sync: await lastSync() },
 		};
 	});
