@@ -48,38 +48,60 @@ every pay run. Use your payroll provider's or tax authority's figures.
    (`ts_xxxx.yyyy`).
 2. In Ledger, an admin pastes it under **Settings → Employees → timesheet.io
    API key**. It is stored as a secret and never shown again.
-3. Hours are then pulled:
+3. Ledger and timesheet.io are then synced:
    - each time someone signs in to Ledger (a setting, on by default; it runs
      within about 15 seconds of the sign-in, for the organization signed in to);
    - with the **Sync** button beside the title of the Employees page;
-   - every hour, if you turn that setting on.
+   - every hour, if you turn that setting on;
+   - and a change made in Ledger is sent right away.
 
-   Connection status, the last pull and *Test the connection* are on the
-   settings page, below the form.
+   Connection status, the last sync, what is waiting to be sent and *Test the
+   connection* are on the settings page, below the form.
 
-A sync reads the tasks of the last 60 days (a setting) and:
+The sync goes both ways.
 
-- matches each person to an employee by email, or adds them as a new employee
+**From timesheet.io** (the tasks of the last 60 days, a setting):
+
+- each person is matched to an employee by email, or added as a new employee
   with no pay rate (a dashboard to-do asks for it);
-- adds each project with its hourly rate; its client is matched to a customer
-  already in Entities with the same name, otherwise you choose the customer;
-- turns each finished task into a time entry: the task's length minus its
-  breaks, on the day it started, billable or not as in timesheet.io. Running
-  timers, mileage and calls are left out;
-- applies edits and deletions made in timesheet.io, **except** to time that is
-  already billed or on a pay run here: that is never changed (the sync says
-  how many it left alone).
+- each project is added with its hourly rate; its client is matched to a
+  customer already in Entities with the same name, otherwise you choose one;
+- each finished task becomes a time entry: its length minus its breaks, on the
+  day it started, billable or not as in timesheet.io. Running timers, mileage
+  and calls are left out;
+- edits and deletions made in timesheet.io are applied (but see *Ledger wins*).
 
-Ledger pulls from timesheet.io; it doesn't receive timesheet.io webhooks,
-because every Ledger module route needs a logged-in Ledger user. The hourly
-sync does that job.
+**To timesheet.io**:
+
+- time entered in Ledger becomes a task for that person and project, starting
+  at 9:00 in the time zone set under Settings (UTC when empty). It needs a
+  project that came from timesheet.io and a person linked to timesheet.io
+  (linked by email once they track time there); otherwise it stays in Ledger
+  only, and the Time tab says why. Moving an entry to another person deletes
+  the task and makes it again under them, since timesheet.io can't change a
+  task's owner;
+- edits and deletions made in Ledger are sent, including to entries that came
+  from timesheet.io. A task keeps its time of day and breaks; only the day and
+  the end move when you change them;
+- billing hours marks their tasks **billed**, posting a pay run marks them
+  **paid**, and reversing either undoes it.
+
+**Ledger wins.** A change made in Ledger that isn't sent yet, and any hours that
+are billed or on a pay run, are never overwritten from timesheet.io: Ledger's
+version is sent back (a task deleted there is made again). A change made only in
+timesheet.io is taken as usual. A change timesheet.io refuses shows as *not
+sent* on the Time tab and on the dashboard, and is tried again on each sync.
+
+Ledger calls timesheet.io; it doesn't receive timesheet.io webhooks, because
+every Ledger module route needs a logged-in Ledger user. The syncs above do
+that job.
 
 ## Settings
 
 Currency (CAD or USD) for all rates, billings and pay runs; the five account
 codes used when posting (each can also be picked, or created, in the dialog
-that posts, and the first choice is remembered); the timesheet.io key, days to
-pull and hourly sync.
+that posts, and the first choice is remembered); the timesheet.io key, time zone,
+days to pull, and when to sync (on sign-in, hourly).
 
 Rates: an hour is billed at the entry's own rate if it has one, else the
 project's, else the employee's.

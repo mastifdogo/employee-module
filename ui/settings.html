@@ -79,13 +79,16 @@
 		const canEdit = summary.role !== "viewer";
 		const last = s.last_sync;
 		$("main").replaceChildren(
-			h("p", {}, "Pulls the time your team tracks in timesheet.io into Ledger: each finished task becomes a time entry, with its person, project and whether it is billable."),
+			h("p", {}, "Keeps Ledger's time entries and timesheet.io's tasks the same, both ways. When the same entry changed in both places, Ledger's version wins."),
 			s.configured
 				? h(
 						"div",
 						{ class: "card" },
 						h("h3", {}, "Connected with an API key", h("span", { class: `chip ${s.auto_sync ? "ok" : ""}` }, [s.on_sign_in && "pulls on sign-in", s.auto_sync && "pulls every hour"].filter(Boolean).join(" · ") || "pulls when you press Sync")),
-						h("p", { class: "muted" }, `Each sync reads the last ${s.days} days. Time already billed or on a pay run is never changed by a sync.`),
+						h("p", { class: "muted" }, `Each sync sends Ledger's changes, then reads the last ${s.days} days from timesheet.io.`),
+						s.to_send + s.not_sent + s.deletions > 0 &&
+							h("p", {}, [s.to_send && `${s.to_send} ${s.to_send === 1 ? "change" : "changes"} waiting to be sent`, s.deletions && `${s.deletions} ${s.deletions === 1 ? "deletion" : "deletions"} waiting`, s.not_sent && `${s.not_sent} timesheet.io refused (see the Time tab)`].filter(Boolean).join(" · ") + "."),
+						s.ledger_only > 0 && h("p", { class: "muted" }, `${s.ledger_only} ${s.ledger_only === 1 ? "entry stays" : "entries stay"} in Ledger only: no timesheet.io project, or a person not linked to timesheet.io yet.`),
 						last && h("p", {}, h("b", {}, last.succeeded === false ? "Last sync failed: " : last.succeeded === null ? "Sync started: " : "Last sync: "), `${new Date(last.started_at).toLocaleString()} by ${last.started_by}. ${last.summary}`),
 						canEdit &&
 							h(
@@ -122,10 +125,10 @@
 			h(
 				"ul",
 				{},
-				h("li", {}, "People: matched to an employee by email, or added as a new employee with no pay rate (set it on the module's People tab)."),
-				h("li", {}, "Projects: added with their hourly rate. Their client is matched to a customer in Entities when the name is the same; otherwise choose the customer on the People tab."),
-				h("li", {}, "Hours: the task's length minus its breaks, on the day it started. Running timers, mileage and calls are left out."),
-				h("li", {}, "Edits and deletions in timesheet.io are picked up by the next sync, except for time already billed or paid here."),
+				h("li", {}, "From timesheet.io: each finished task becomes a time entry (its length minus breaks, on the day it started). People are matched by email or added; projects are added with their rate. Running timers, mileage and calls are left out."),
+				h("li", {}, "To timesheet.io: time entered in Ledger becomes a task for that person and project (starting at 9:00 in the time zone above). It needs a project from timesheet.io and a person linked to timesheet.io; otherwise it stays in Ledger only."),
+				h("li", {}, "Edits and deletions go both ways. Billing hours marks them billed in timesheet.io, posting a pay run marks them paid; reversing undoes it."),
+				h("li", {}, "Ledger wins: a change made in Ledger that isn't sent yet, and any billed or paid hours, are never overwritten from timesheet.io; Ledger's version is sent back instead."),
 			),
 		);
 	}

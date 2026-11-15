@@ -1,6 +1,6 @@
 // Employees: time entries, billable hours and payroll, with time pulled from timesheet.io.
 // Ledger loads this file at startup and calls register(ctx).
-import { TimesheetError, checkKey, profile, readTask, tasksSince } from "./lib/timesheet.mjs";
+import { TimesheetError, addSeconds, checkKey, createTask, deleteTask, profile, readTask, spanSeconds, tasksSince, updateTask, zoneOffset } from "./lib/timesheet.mjs";
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const ID = /^\d{1,15}$/;
@@ -196,7 +196,7 @@ export default async function register(ctx) {
 	// What an hour of this entry is charged at: its own rate, else the project's, else the employee's.
 	const RATE = `COALESCE(t.bill_rate_cents, p.bill_rate_cents, e.bill_rate_cents, 0)`;
 	const TIME = `t.id, t.employee_id, e.name AS employee_name, t.project_id, p.name AS project_name, p.customer_entity_id, t.work_date, t.minutes,
-		t.description, t.billable, t.bill_rate_cents, t.source, t.billing_id, t.pay_run_id,
+		t.description, t.billable, t.bill_rate_cents, t.source, t.billing_id, t.pay_run_id, t.push_status, t.push_error, t.timesheet_task_id IS NOT NULL AS in_timesheet,
 		COALESCE(t.billed_rate_cents, ${RATE}) AS rate_cents,
 		COALESCE(t.billed_amount_cents, round(t.minutes * ${RATE} / 60.0)::bigint) AS amount_cents
 		FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id LEFT JOIN ${S}.projects p ON p.id = t.project_id`;
@@ -262,14 +262,15 @@ export default async function register(ctx) {
 		const f = await timeFields(body(req), false);
 		const keys = Object.keys(f);
 		const { rows } = await q(
-			`INSERT INTO ${S}.time_entries (${keys.join(", ")}, created_by) VALUES (${keys.map((_, i) => `$${i + 1}`).join(", ")}, $${keys.length + 1}) RETURNING id`,
+			`INSERT INTO ${S}.time_entries (${keys.join(", ")}, created_by, push_status) VALUES (${keys.map((_, i) => `$${i + 1}`).join(", ")}, $${keys.length + 1}, 'pending') RETURNING id`,
 			[...keys.map((k) => f[k]), req.user.username],
 		);
+		pushSoon(req);
 		return ctx.response(201, { id: rows[0].id });
 	});
 
 	async function openEntry(id) {
-		const { rows } = await q(`SELECT id, source, billing_id, pay_run_id FROM ${S}.time_entries WHERE id = $1`, [id]);
+		const { rows } = await q(`SELECT id, source, billing_id, pay_run_id, timesheet_task_id FROM ${S}.time_entries WHERE id = $1`, [id]);
 		if (rows.length === 0) throw new ctx.HttpError(404, "no such time entry");
 		if (rows[0].billing_id !== null) throw new ctx.HttpError(409, "This time is already billed. Reverse the billing to change it.");
 		if (rows[0].pay_run_id !== null) throw new ctx.HttpError(409, "This time is on a pay run. Delete or reverse the pay run to change it.");
@@ -282,29 +283,37 @@ export default async function register(ctx) {
 		const f = await timeFields(body(req), true);
 		const keys = Object.keys(f);
 		if (keys.length === 0) throw bad("nothing to change");
-		if (entry.source === "timesheet" && keys.some((k) => k !== "bill_rate_cents"))
-			throw new ctx.HttpError(409, "This entry comes from timesheet.io: change it there and sync. Only its billing rate can be set here.");
+		// The billing rate is Ledger's own; anything else is sent to timesheet.io (Ledger wins).
+		const send = keys.some((k) => k !== "bill_rate_cents");
 		const { rowCount } = await q(
-			`UPDATE ${S}.time_entries SET ${keys.map((k, i) => `${k} = $${i + 2}`).join(", ")}, updated_at = now() WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL`,
+			`UPDATE ${S}.time_entries SET ${keys.map((k, i) => `${k} = $${i + 2}`).join(", ")}, ${send ? "push_status = 'pending', push_error = '', " : ""}updated_at = now()
+			WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL`,
 			[id, ...keys.map((k) => f[k])],
 		);
 		if (rowCount === 0) throw new ctx.HttpError(409, "This time entry was just billed or paid.");
+		if (send) pushSoon(req);
 		return { id: entry.id };
 	});
 
 	ctx.route("DELETE", "/time/:id", async (req) => {
 		const id = paramId(req, "time entry");
 		const entry = await openEntry(id);
-		if (entry.source === "timesheet") throw new ctx.HttpError(409, "This entry comes from timesheet.io: delete it there and sync.");
-		const { rowCount } = await q(`DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL`, [id]);
-		if (rowCount === 0) throw new ctx.HttpError(409, "This time entry was just billed or paid.");
+		// Its task in timesheet.io is deleted too (queued, so a failed call is retried).
+		const { rows: gone } = await q(
+			`WITH gone AS (DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL RETURNING timesheet_task_id),
+			queued AS (INSERT INTO ${S}.timesheet_deletions (task_id, requested_by) SELECT timesheet_task_id, $2 FROM gone WHERE timesheet_task_id IS NOT NULL ON CONFLICT (task_id) DO NOTHING)
+			SELECT timesheet_task_id FROM gone`,
+			[id, req.user.username],
+		);
+		if (gone.length === 0) throw new ctx.HttpError(409, "This time entry was just billed or paid.");
+		if (entry.timesheet_task_id) pushSoon(req);
 	});
 
 	// ---- billings: bill a customer for billable hours -----------------------------
 	const BILL = `id, customer_entity_id, customer_name, period_start, period_end, billing_date, currency, total_minutes, total_cents, status, journal_entry_id, created_by, created_at, reversed_by, reversed_at`;
 	const releaseBilling = (id, drop) =>
 		q(
-			`WITH freed AS (UPDATE ${S}.time_entries SET billing_id = NULL, billed_rate_cents = NULL, billed_amount_cents = NULL, updated_at = now() WHERE billing_id = $1 RETURNING 1)
+			`WITH freed AS (UPDATE ${S}.time_entries SET billing_id = NULL, billed_rate_cents = NULL, billed_amount_cents = NULL, push_status = 'pending', push_error = '', updated_at = now() WHERE billing_id = $1 RETURNING 1)
 			${drop ? `DELETE FROM ${S}.billings WHERE id = $1` : `SELECT count(*) FROM freed`}`,
 			[id],
 		);
@@ -350,7 +359,7 @@ export default async function register(ctx) {
 				VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
 			), claimed AS (
 				UPDATE ${S}.time_entries t
-				SET billing_id = (SELECT id FROM b), billed_rate_cents = r.rate, billed_amount_cents = round(t.minutes * r.rate / 60.0)::bigint, updated_at = now()
+				SET billing_id = (SELECT id FROM b), billed_rate_cents = r.rate, billed_amount_cents = round(t.minutes * r.rate / 60.0)::bigint, push_status = 'pending', push_error = '', updated_at = now()
 				FROM ${S}.time_entries t2
 				JOIN ${S}.employees e ON e.id = t2.employee_id
 				JOIN ${S}.projects p ON p.id = t2.project_id
@@ -392,6 +401,7 @@ export default async function register(ctx) {
 			made.minutes,
 			made.total,
 		]);
+		pushSoon(req);
 		return ctx.response(201, done.rows[0]);
 	});
 
@@ -415,6 +425,7 @@ export default async function register(ctx) {
 		await reverseEntryOf(rows[0].journal_entry_id, `Reversal: billed hours ${id} · ${rows[0].customer_name}`, req.user);
 		await q(`UPDATE ${S}.billings SET status = 'reversed', reversed_by = $2, reversed_at = now() WHERE id = $1`, [id, req.user.username]);
 		await releaseBilling(id, false);
+		pushSoon(req);
 		return { id: rows[0].id, status: "reversed" };
 	});
 
@@ -425,7 +436,7 @@ export default async function register(ctx) {
 		(SELECT COALESCE(sum(l.deductions_cents), 0)::bigint FROM ${S}.pay_run_lines l WHERE l.pay_run_id = r.id) AS deductions_cents,
 		(SELECT COALESCE(sum(l.employer_cost_cents), 0)::bigint FROM ${S}.pay_run_lines l WHERE l.pay_run_id = r.id) AS employer_cost_cents,
 		(SELECT COALESCE(sum(l.gross_cents - l.deductions_cents), 0)::bigint FROM ${S}.pay_run_lines l WHERE l.pay_run_id = r.id) AS net_cents`;
-	const releaseRun = (id) => q(`UPDATE ${S}.time_entries SET pay_run_id = NULL, updated_at = now() WHERE pay_run_id = $1`, [id]);
+	const releaseRun = (id) => q(`UPDATE ${S}.time_entries SET pay_run_id = NULL, push_status = 'pending', push_error = '', updated_at = now() WHERE pay_run_id = $1`, [id]);
 
 	async function getRun(id) {
 		const { rows } = await q(`SELECT ${RUN}, ${RUN_TOTALS} FROM ${S}.pay_runs r WHERE r.id = $1`, [id]);
@@ -560,6 +571,9 @@ export default async function register(ctx) {
 			paidFrom,
 			req.user.username,
 		]);
+		// Its hours are now paid: say so in timesheet.io.
+		await q(`UPDATE ${S}.time_entries SET push_status = 'pending', push_error = '', updated_at = now() WHERE pay_run_id = $1`, [id]);
+		pushSoon(req);
 		return getRun(id);
 	});
 
@@ -570,33 +584,167 @@ export default async function register(ctx) {
 		await reverseEntryOf(run.journal_entry_id, `Reversal: pay run ${id}`, req.user);
 		await q(`UPDATE ${S}.pay_runs SET status = 'reversed', reversed_by = $2, reversed_at = now() WHERE id = $1`, [id, req.user.username]);
 		await releaseRun(id);
+		pushSoon(req);
 		return getRun(id);
 	});
 
 	// ---- timesheet.io ---------------------------------------------------------
 	const asHttp = (e) => (e instanceof TimesheetError ? new ctx.HttpError(e.status, e.message) : e);
-	const syncing = new Set(); // organization ids with a sync under way (this process only)
+
+	// One timesheet.io job at a time per organization (this process): a sync or a push waits for the one before it.
+	const chains = new Map();
+	const queuedPush = new Set();
+	function serial(orgId, fn) {
+		const run = (chains.get(orgId) ?? Promise.resolve()).then(fn);
+		chains.set(
+			orgId,
+			run.catch(() => {}),
+		);
+		return run;
+	}
+	/** Sends Ledger's changes to timesheet.io after the request answers (one queued push per organization). */
+	function pushSoon(req) {
+		const orgId = req.user.organization?.id ?? 1;
+		if (queuedPush.has(orgId)) return;
+		queuedPush.add(orgId);
+		serial(orgId, async () => {
+			queuedPush.delete(orgId);
+			const s = await ctx.settings.get();
+			if (s.timesheet_api_key) await push(s);
+		}).catch((e) => ctx.log.warn("sending to timesheet.io failed", { error: String(e?.message ?? e) }));
+	}
 
 	async function lastSync() {
 		const { rows } = await q(`SELECT id, started_at, finished_at, started_by, succeeded, summary FROM ${S}.timesheet_syncs ORDER BY id DESC LIMIT 1`);
 		return rows[0] ?? null;
 	}
 
-	/** Pulls tasks from timesheet.io into time entries. Entries already billed or paid are never changed. */
-	async function sync(settings, who, orgId) {
+	/** Start and end to send: the task's own when Ledger didn't change its day or length, else rebuilt from Ledger's. */
+	function timesFor(row, timeZone) {
+		const breaks = row.timesheet_break_seconds ?? 0;
+		if (row.timesheet_start && row.timesheet_end && row.timesheet_start.slice(0, 10) === row.work_date && Math.round((spanSeconds(row.timesheet_start, row.timesheet_end) - breaks) / 60) === row.minutes)
+			return { start: row.timesheet_start, end: row.timesheet_end, breaks };
+		// Keep the time of day and offset timesheet.io had; a new entry starts at 9:00 in the chosen time zone.
+		const start = row.timesheet_start ? `${row.work_date}${row.timesheet_start.slice(10)}` : `${row.work_date}T09:00:00${zoneOffset(timeZone, row.work_date)}`;
+		return { start, end: addSeconds(start, row.minutes * 60 + breaks), breaks };
+	}
+
+	/**
+	 * Sends Ledger's changes to timesheet.io (Ledger wins): new and changed time entries, billed and
+	 * paid state, and deletions. Each entry records how it went; nothing here throws for one entry.
+	 */
+	async function push(settings) {
 		const key = checkKey(settings.timesheet_api_key);
-		if (syncing.has(orgId)) throw new TimesheetError(409, "A sync is already running.");
-		syncing.add(orgId);
+		const timeZone = typeof settings.timesheet_time_zone === "string" && settings.timesheet_time_zone.trim() ? settings.timesheet_time_zone.trim() : "UTC";
+		try {
+			zoneOffset(timeZone, today());
+		} catch {
+			throw new TimesheetError(409, `The time zone "${timeZone}" under Settings → Employees isn't one timesheet.io times can use (try e.g. America/Toronto).`);
+		}
+		const n = { sent: 0, failed: 0, ledger_only: 0, deleted: 0 };
+
+		for (const d of (await q(`SELECT task_id FROM ${S}.timesheet_deletions ORDER BY requested_at LIMIT 500`)).rows) {
+			try {
+				await deleteTask(key, d.task_id);
+				await q(`DELETE FROM ${S}.timesheet_deletions WHERE task_id = $1`, [d.task_id]);
+				n.deleted++;
+			} catch (e) {
+				if (e instanceof TimesheetError && e.status === 409) throw e; // the key: stop here
+				await q(`UPDATE ${S}.timesheet_deletions SET last_error = $2 WHERE task_id = $1`, [d.task_id, String(e?.message ?? e).slice(0, 1000)]);
+				n.failed++;
+			}
+		}
+
+		const { rows } = await q(
+			`SELECT t.id, t.work_date, t.minutes, t.description, t.billable, t.updated_at::text AS updated_stamp, t.timesheet_task_id, t.timesheet_task_user_id,
+				t.timesheet_start, t.timesheet_end, t.timesheet_break_seconds, t.push_status,
+				e.name AS employee_name, e.timesheet_user_id, p.name AS project_name, p.timesheet_project_id,
+				(t.billing_id IS NOT NULL) AS billed, COALESCE(r.status = 'posted', false) AS paid
+			FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id
+			LEFT JOIN ${S}.projects p ON p.id = t.project_id LEFT JOIN ${S}.pay_runs r ON r.id = t.pay_run_id
+			WHERE t.push_status IN ('pending', 'failed')
+				OR (t.push_status = 'ledger_only' AND e.timesheet_user_id IS NOT NULL AND p.timesheet_project_id IS NOT NULL)
+			ORDER BY t.id LIMIT 500`,
+		);
+		for (const row of rows) {
+			const done = (status, error, extra = {}) =>
+				q(
+					// The task id is kept whatever happens; the entry is only "synced" if nobody changed it meanwhile.
+					`UPDATE ${S}.time_entries SET timesheet_task_id = COALESCE($3, timesheet_task_id), timesheet_task_user_id = COALESCE($4, timesheet_task_user_id),
+						timesheet_start = COALESCE($5, timesheet_start), timesheet_end = COALESCE($6, timesheet_end), timesheet_break_seconds = COALESCE($7, timesheet_break_seconds),
+						timesheet_last_update_ms = COALESCE($8, timesheet_last_update_ms),
+						push_status = CASE WHEN updated_at::text = $2 THEN $9 ELSE push_status END, push_error = CASE WHEN updated_at::text = $2 THEN $10 ELSE push_error END,
+						pushed_at = CASE WHEN $9 = 'synced' THEN now() ELSE pushed_at END
+					WHERE id = $1`,
+					[row.id, row.updated_stamp, extra.task_id ?? null, extra.user ?? null, extra.start ?? null, extra.end ?? null, extra.breaks ?? null, extra.last_update ?? null, status, error.slice(0, 1000)],
+				);
+			if (!row.timesheet_project_id) {
+				await done("ledger_only", row.project_name ? `The project ${row.project_name} isn't in timesheet.io, so this time stays in Ledger.` : "No project: timesheet.io needs one, so this time stays in Ledger.");
+				n.ledger_only++;
+				continue;
+			}
+			if (!row.timesheet_user_id) {
+				await done("ledger_only", `${row.employee_name} isn't linked to a timesheet.io account yet (they are linked by email once they track time there), so this time stays in Ledger.`);
+				n.ledger_only++;
+				continue;
+			}
+			try {
+				const t = timesFor(row, timeZone);
+				const fields = { projectId: row.timesheet_project_id, description: row.description, startDateTime: t.start, endDateTime: t.end, billable: row.billable, billed: row.billed, paid: row.paid };
+				let task = null;
+				if (row.timesheet_task_id && row.timesheet_task_user_id && row.timesheet_task_user_id !== row.timesheet_user_id) {
+					// Moved to another person: timesheet.io can't change a task's owner, so it is made again under them.
+					await deleteTask(key, row.timesheet_task_id);
+				} else if (row.timesheet_task_id) {
+					try {
+						task = await updateTask(key, row.timesheet_task_id, { ...fields, deleted: false });
+					} catch (e) {
+						if (!(e instanceof TimesheetError && e.status === 404)) throw e; // deleted there: made again
+					}
+				}
+				task ??= await createTask(key, { ...fields, userId: row.timesheet_user_id });
+				const last = Number(task.lastUpdate);
+				await done("synced", "", { task_id: String(task.id ?? row.timesheet_task_id), user: row.timesheet_user_id, start: t.start, end: t.end, breaks: t.breaks, last_update: Number.isFinite(last) ? Math.trunc(last) : null });
+				n.sent++;
+			} catch (e) {
+				if (e instanceof TimesheetError && e.status === 409) throw e; // the key: stop here
+				await done("failed", String(e?.message ?? e));
+				n.failed++;
+			}
+		}
+		if (n.failed) await ctx.dashboard.notify({ key: "timesheet-push", title: `${n.failed} time ${n.failed === 1 ? "change" : "changes"} couldn't be sent to timesheet.io`, body: "They are tried again on the next sync. The Time tab shows why.", level: "warning", link: "/apps/employees" }).catch(() => {});
+		else if (n.sent || n.deleted) await ctx.dashboard.dismiss("timesheet-push").catch(() => {});
+		return n;
+	}
+
+	/**
+	 * Sends Ledger's changes, pulls timesheet.io's, then sends what the pull found Ledger must win.
+	 * Ledger wins: a change made in Ledger and not yet sent, and any billed or paid entry, is never
+	 * overwritten by timesheet.io; Ledger's version is sent back instead.
+	 */
+	function sync(settings, who, orgId) {
+		return serial(orgId, () => syncNow(settings, who));
+	}
+
+	async function syncNow(settings, who) {
+		const key = checkKey(settings.timesheet_api_key);
 		const log = await q(`INSERT INTO ${S}.timesheet_syncs (started_by) VALUES ($1) RETURNING id`, [who]);
 		const finish = (ok, summary) => q(`UPDATE ${S}.timesheet_syncs SET finished_at = now(), succeeded = $2, summary = $3 WHERE id = $1`, [log.rows[0].id, ok, summary.slice(0, 2000)]);
 		try {
+			const sent = await push(settings);
 			const days = Number.isInteger(settings.timesheet_sync_days) ? settings.timesheet_sync_days : 60;
 			const since = daysAgo(days);
 			const { tasks, complete } = await tasksSince(key, since);
 
 			const known = new Map(); // timesheet task id → our entry
-			for (const r of (await q(`SELECT id, timesheet_task_id, timesheet_last_update_ms, work_date, (billing_id IS NOT NULL OR pay_run_id IS NOT NULL) AS locked FROM ${S}.time_entries WHERE source = 'timesheet'`)).rows)
+			for (const r of (
+				await q(
+					`SELECT id, timesheet_task_id, timesheet_last_update_ms, work_date, push_status, (billing_id IS NOT NULL OR pay_run_id IS NOT NULL) AS locked
+					FROM ${S}.time_entries WHERE timesheet_task_id IS NOT NULL`,
+				)
+			).rows)
 				known.set(r.timesheet_task_id, r);
+			const deleting = new Set((await q(`SELECT task_id FROM ${S}.timesheet_deletions`)).rows.map((r) => r.task_id));
 			const employees = new Map();
 			const byEmail = new Map();
 			for (const r of (await q(`SELECT id, lower(email) AS email, timesheet_user_id FROM ${S}.employees`)).rows) {
@@ -606,8 +754,14 @@ export default async function register(ctx) {
 			const projects = new Map();
 			for (const r of (await q(`SELECT id, name, timesheet_project_id, timesheet_client_name FROM ${S}.projects WHERE timesheet_project_id IS NOT NULL`)).rows) projects.set(r.timesheet_project_id, r);
 
-			const n = { added: 0, updated: 0, removed: 0, locked: 0, skipped: 0, employees: 0, projects: 0 };
+			const n = { added: 0, updated: 0, removed: 0, kept: 0, skipped: 0, employees: 0, projects: 0 };
 			const seen = new Set();
+			// Ledger wins: send Ledger's version back on the push after the pull.
+			const keep = async (have) => {
+				await q(`UPDATE ${S}.time_entries SET push_status = 'pending', push_error = '' WHERE id = $1 AND push_status IN ('synced', 'failed')`, [have.id]);
+				n.kept++;
+			};
+			const mine = (have) => have.locked || have.push_status === "pending" || have.push_status === "failed";
 
 			async function employeeFor(u) {
 				if (employees.has(u.id)) return employees.get(u.id);
@@ -665,69 +819,86 @@ export default async function register(ctx) {
 					continue;
 				}
 				seen.add(t.id);
+				if (deleting.has(t.id)) continue; // deleted in Ledger; the deletion is on its way
 				const have = known.get(t.id);
 				if (t.deleted) {
 					if (!have) continue;
-					if (have.locked) n.locked++;
+					if (mine(have)) await keep(have); // made again in timesheet.io
 					else {
-						await q(`DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL`, [have.id]);
+						await q(`DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL AND push_status = 'synced'`, [have.id]);
 						n.removed++;
 					}
 					continue;
 				}
 				if (have && t.last_update_ms !== null && have.timesheet_last_update_ms !== null && BigInt(t.last_update_ms) === have.timesheet_last_update_ms) continue; // unchanged
-				if (have?.locked) {
-					n.locked++;
+				if (have && mine(have)) {
+					await keep(have);
 					continue;
 				}
 				const employeeId = await employeeFor(t.user);
 				const projectId = await projectFor(t.project);
 				const r = await q(
-					`INSERT INTO ${S}.time_entries (employee_id, project_id, work_date, minutes, description, billable, source, timesheet_task_id, timesheet_last_update_ms, created_by)
-					VALUES ($1, $2, $3, $4, $5, $6, 'timesheet', $7, $8, $9)
+					`INSERT INTO ${S}.time_entries (employee_id, project_id, work_date, minutes, description, billable, source, timesheet_task_id, timesheet_last_update_ms,
+						timesheet_task_user_id, timesheet_start, timesheet_end, timesheet_break_seconds, push_status, created_by)
+					VALUES ($1, $2, $3, $4, $5, $6, 'timesheet', $7, $8, $9, $10, $11, $12, 'synced', $13)
 					ON CONFLICT (timesheet_task_id) DO UPDATE SET employee_id = EXCLUDED.employee_id, project_id = EXCLUDED.project_id, work_date = EXCLUDED.work_date,
 						minutes = EXCLUDED.minutes, description = EXCLUDED.description, billable = EXCLUDED.billable,
-						timesheet_last_update_ms = EXCLUDED.timesheet_last_update_ms, updated_at = now()
-					WHERE ${S}.time_entries.billing_id IS NULL AND ${S}.time_entries.pay_run_id IS NULL
+						timesheet_last_update_ms = EXCLUDED.timesheet_last_update_ms, timesheet_task_user_id = EXCLUDED.timesheet_task_user_id,
+						timesheet_start = EXCLUDED.timesheet_start, timesheet_end = EXCLUDED.timesheet_end, timesheet_break_seconds = EXCLUDED.timesheet_break_seconds, updated_at = now()
+					WHERE ${S}.time_entries.billing_id IS NULL AND ${S}.time_entries.pay_run_id IS NULL AND ${S}.time_entries.push_status = 'synced'
 					RETURNING (xmax = 0) AS inserted`,
-					[employeeId, projectId, t.work_date, t.minutes, t.description, t.billable, t.id, t.last_update_ms, who],
+					[employeeId, projectId, t.work_date, t.minutes, t.description, t.billable, t.id, t.last_update_ms, t.user.id, t.start, t.end, t.break_seconds, who],
 				);
-				if (r.rows.length === 0) n.locked++;
-				else if (r.rows[0].inserted) n.added++;
+				if (r.rows.length === 0) {
+					// Changed in Ledger meanwhile: Ledger wins.
+					const now = (await q(`SELECT id, push_status, (billing_id IS NOT NULL OR pay_run_id IS NOT NULL) AS locked FROM ${S}.time_entries WHERE timesheet_task_id = $1`, [t.id])).rows[0];
+					if (now) await keep(now);
+				} else if (r.rows[0].inserted) n.added++;
 				else n.updated++;
 			}
 			// Entries whose task is gone from timesheet.io (only when the whole window was read).
 			if (complete && tasks.length > 0)
 				for (const [taskId, have] of known)
 					if (!seen.has(taskId) && have.work_date > since) {
-						if (have.locked) n.locked++;
+						if (mine(have)) await keep(have);
 						else {
-							await q(`DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL`, [have.id]);
+							await q(`DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL AND push_status = 'synced'`, [have.id]);
 							n.removed++;
 						}
 					}
 
+			const after = n.kept ? await push(settings) : { sent: 0, failed: 0, ledger_only: 0, deleted: 0 };
+			const out = { sent: sent.sent + after.sent, failed: after.failed || sent.failed, deleted: sent.deleted + after.deleted, ledger_only: sent.ledger_only };
 			const parts = [`${tasks.length} entries read since ${since}: ${n.added} added, ${n.updated} updated, ${n.removed} removed`];
+			if (out.sent || out.deleted) parts.push(`${out.sent} sent to timesheet.io${out.deleted ? `, ${out.deleted} deleted there` : ""}`);
+			if (n.kept) parts.push(`${n.kept} changed in both places: Ledger's version kept and sent back`);
+			if (out.failed) parts.push(`${out.failed} couldn't be sent (tried again next time)`);
 			if (n.employees) parts.push(`${n.employees} new employees (set their pay rates)`);
 			if (n.projects) parts.push(`${n.projects} new projects`);
-			if (n.locked) parts.push(`${n.locked} changed in timesheet.io after being billed or paid here and left as they were`);
 			if (n.skipped) parts.push(`${n.skipped} skipped (still running or no length)`);
 			if (!complete) parts.push("stopped at 10,000 entries: lower the days to pull");
 			const summary = `${parts.join("; ")}.`;
 			await finish(true, summary);
 			await refreshTodos();
-			return { summary, ...n };
+			return { summary, ...n, ...out };
 		} catch (e) {
 			await finish(false, String(e?.message ?? e)).catch(() => {});
 			throw e;
-		} finally {
-			syncing.delete(orgId);
 		}
+	}
+
+	async function pushCounts() {
+		const { rows } = await q(
+			`SELECT count(*) FILTER (WHERE push_status = 'pending')::int AS to_send, count(*) FILTER (WHERE push_status = 'failed')::int AS not_sent,
+				count(*) FILTER (WHERE push_status = 'ledger_only')::int AS ledger_only, (SELECT count(*)::int FROM ${S}.timesheet_deletions) AS deletions
+			FROM ${S}.time_entries`,
+		);
+		return rows[0];
 	}
 
 	ctx.route("GET", "/timesheet/status", async () => {
 		const s = await ctx.settings.get();
-		return { configured: Boolean(s.timesheet_api_key), auto_sync: s.timesheet_auto_sync === true, on_sign_in: s.timesheet_sync_on_login !== false, days: s.timesheet_sync_days ?? 60, last_sync: await lastSync() };
+		return { configured: Boolean(s.timesheet_api_key), auto_sync: s.timesheet_auto_sync === true, on_sign_in: s.timesheet_sync_on_login !== false, days: s.timesheet_sync_days ?? 60, last_sync: await lastSync(), ...(await pushCounts()) };
 	});
 
 	ctx.route("POST", "/timesheet/test", async () => {
@@ -859,7 +1030,6 @@ export default async function register(ctx) {
 					await sync(s, who, org.id);
 					await ctx.dashboard.dismiss("timesheet-sync");
 				} catch (e) {
-					if (e instanceof TimesheetError && e.message === "A sync is already running.") return;
 					await ctx.dashboard.notify({ key: "timesheet-sync", title: "Pulling hours from timesheet.io failed", body: String(e?.message ?? e).slice(0, 500), level: "warning", link: "/settings/m/employees" });
 				}
 			})

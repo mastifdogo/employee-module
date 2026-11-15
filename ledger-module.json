@@ -1,7 +1,7 @@
 {
   "id": "employees",
   "name": "Employees",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Track employee time, bill customers for billable hours and run payroll, with time pulled from timesheet.io.",
   "ledger": ">=0.16.0",
   "server": "server.mjs",
@@ -22,7 +22,8 @@
       { "key": "payroll_liabilities_account", "label": "Payroll liabilities account code", "type": "text", "help": "Liability account credited with amounts withheld from pay plus the employer's share, until they are remitted." },
       { "key": "receivable_account", "label": "Accounts receivable account code", "type": "text", "help": "Debited when billable hours are billed to a customer." },
       { "key": "revenue_account", "label": "Revenue account code for billed hours", "type": "text", "help": "Credited when billable hours are billed to a customer." },
-      { "key": "timesheet_api_key", "label": "timesheet.io API key", "type": "secret", "help": "Create one at my.timesheet.io → Development → API keys. It looks like ts_xxxx.yyyy." },
+      { "key": "timesheet_api_key", "label": "timesheet.io API key", "type": "secret", "help": "Create one at my.timesheet.io → Development → API keys. It looks like ts_xxxx.yyyy. Time is synced both ways: changes made in Ledger are sent to timesheet.io and win." },
+      { "key": "timesheet_time_zone", "label": "Time zone for time sent to timesheet.io", "type": "text", "default": "", "help": "For time entered in Ledger, which starts at 9:00 there, e.g. America/Toronto. Empty: UTC." },
       { "key": "timesheet_sync_days", "label": "Days of time to pull from timesheet.io", "type": "number", "min": 1, "max": 730, "default": 60, "help": "Each sync re-reads this many days back, so edits made in timesheet.io are picked up." },
       { "key": "timesheet_sync_on_login", "label": "Pull from timesheet.io when someone signs in to Ledger", "type": "boolean", "default": true },
       { "key": "timesheet_auto_sync", "label": "Pull from timesheet.io every hour", "type": "boolean", "default": false }

@@ -87,7 +87,7 @@
 </style>
 </head>
 <body>
-<div class="head"><h1>Employees</h1><button id="syncTop" class="small" hidden title="Pull the latest hours from timesheet.io">Sync</button></div>
+<div class="head"><h1>Employees</h1><button id="syncTop" class="small" hidden title="Send Ledger's changes to timesheet.io and pull the latest hours from it">Sync</button></div>
 <div class="tiles" id="tiles"></div>
 <div id="msg"></div>
 <nav id="tabs" role="tablist"></nav>
@@ -293,7 +293,7 @@
 	}
 	$("syncTop").onclick = (ev) => act(syncNow)(ev);
 	async function syncNow() {
-		say("Pulling hours from timesheet.io…");
+		say("Syncing with timesheet.io…");
 		const r = await send("POST", "/timesheet/sync");
 		await loadShared();
 		await show(st.tab);
@@ -304,14 +304,13 @@
 	const timeFilter = { from: monthStart(), to: "", employee_id: "", show: "" };
 
 	function entryForm(entry) {
-		const fromTimesheet = entry?.source === "timesheet";
 		const f = {
-			employee: h("select", { required: true, disabled: fromTimesheet }, h("option", { value: "" }, "Choose…"), st.employees.filter((e) => e.is_active || e.id === entry?.employee_id).map((e) => h("option", { value: e.id }, e.name))),
-			date: h("input", { type: "date", required: true, value: entry?.work_date ?? today(), disabled: fromTimesheet }),
-			hours: h("input", { class: "num", inputmode: "decimal", required: true, placeholder: "e.g. 7.5", value: entry ? (entry.minutes / 60).toFixed(2) : "", disabled: fromTimesheet }),
-			project: h("select", { disabled: fromTimesheet }, h("option", { value: "" }, "No project"), st.projects.filter((p) => p.is_active || p.id === entry?.project_id).map((p) => h("option", { value: p.id }, p.customer_name ? `${p.name} · ${p.customer_name}` : p.name))),
-			description: h("input", { maxlength: 2000, value: entry?.description ?? "", disabled: fromTimesheet }),
-			billable: h("input", { type: "checkbox", checked: entry?.billable ?? false, disabled: fromTimesheet }),
+			employee: h("select", { required: true }, h("option", { value: "" }, "Choose…"), st.employees.filter((e) => e.is_active || e.id === entry?.employee_id).map((e) => h("option", { value: e.id }, e.name))),
+			date: h("input", { type: "date", required: true, value: entry?.work_date ?? today() }),
+			hours: h("input", { class: "num", inputmode: "decimal", required: true, placeholder: "e.g. 7.5", value: entry ? (entry.minutes / 60).toFixed(2) : "" }),
+			project: h("select", {}, h("option", { value: "" }, "No project"), st.projects.filter((p) => p.is_active || p.id === entry?.project_id).map((p) => h("option", { value: p.id }, p.customer_name ? `${p.name} · ${p.customer_name}` : p.name))),
+			description: h("input", { maxlength: 2000, value: entry?.description ?? "" }),
+			billable: h("input", { type: "checkbox", checked: entry?.billable ?? false }),
 			rate: h("input", { class: "num", inputmode: "decimal", placeholder: "project or employee rate", value: dollars(entry?.bill_rate_cents) }),
 		};
 		if (entry) {
@@ -321,24 +320,33 @@
 		const node = h(
 			"div",
 			{},
-			fromTimesheet && h("p", { class: "note" }, "This entry comes from timesheet.io. Change it there and sync; only its billing rate can be set here."),
+			entry?.in_timesheet && h("p", { class: "note" }, "This entry is also in timesheet.io. Changes you make here are sent there, and win over changes made there in the meantime."),
 			h("div", { class: "row" }, field("Employee", f.employee), field("Date", f.date), field("Hours", f.hours)),
 			h("div", { class: "row" }, field("Project", f.project), field("What was done", f.description)),
 			h("div", { class: "row" }, h("label", { class: "check" }, f.billable, "Billable"), field(`Billing rate per hour (${cur()})`, f.rate, "Leave empty to use the project's or the employee's rate.")),
 		);
 		const read = () => {
 			const rate = f.rate.value.trim() === "" ? null : toCents(f.rate.value);
-			if (fromTimesheet) return { bill_rate_cents: rate };
 			const hours = Number(f.hours.value.replace(",", "."));
 			if (!Number.isFinite(hours) || hours <= 0) throw new Error("Enter the hours worked, e.g. 7.5");
-			return { employee_id: Number(f.employee.value), work_date: f.date.value, minutes: Math.round(hours * 60), project_id: f.project.value ? Number(f.project.value) : null, description: f.description.value, billable: f.billable.checked, bill_rate_cents: rate };
+			const all = { employee_id: Number(f.employee.value), work_date: f.date.value, minutes: Math.round(hours * 60), project_id: f.project.value ? Number(f.project.value) : null, description: f.description.value.trim(), billable: f.billable.checked, bill_rate_cents: rate };
+			if (!entry) return all;
+			// Only what changed, so a new billing rate alone isn't sent to timesheet.io.
+			const was = { ...entry, bill_rate_cents: entry.bill_rate_cents === null ? null : Number(entry.bill_rate_cents) };
+			const changed = Object.fromEntries(Object.entries(all).filter(([k, v]) => v !== (k === "employee_id" || k === "project_id" ? (was[k] === null ? null : Number(was[k])) : was[k])));
+			return Object.keys(changed).length ? changed : { bill_rate_cents: all.bill_rate_cents };
 		};
 		return { node, read };
 	}
 
 	function entryStatus(t) {
 		const out = [];
-		if (t.source === "timesheet") out.push(chip("timesheet.io"));
+		const sync = { pending: ["to send", "warn", "Waiting to be sent to timesheet.io (on the next sync, or in a moment)."], failed: ["not sent", "bad", t.push_error], ledger_only: ["Ledger only", "", t.push_error] }[t.push_status];
+		if (sync) {
+			const c = chip(sync[0], sync[1]);
+			if (sync[2]) c.title = sync[2];
+			out.push(c);
+		} else if (t.in_timesheet) out.push(chip("timesheet.io"));
 		if (t.billing_id !== null) out.push(chip("billed", "ok"));
 		else if (t.billable) out.push(chip("billable", "warn"));
 		if (t.pay_run_id !== null) out.push(chip("on pay run", "ok"));
@@ -414,8 +422,8 @@
 												},
 												"Edit",
 											),
-											t.source === "manual" && " ",
-											t.source === "manual" && h("button", { class: "danger small", title: "Delete", onclick: act(async () => confirm(`Delete ${hrs(t.minutes)} h of ${t.employee_name} on ${t.work_date}?`) && (await api(`/time/${t.id}`, { method: "DELETE" }), await reload())) }, "✕"),
+											" ",
+											h("button", { class: "danger small", title: "Delete", onclick: act(async () => confirm(`Delete ${hrs(t.minutes)} h of ${t.employee_name} on ${t.work_date}${t.in_timesheet ? ", here and in timesheet.io" : ""}?`) && (await api(`/time/${t.id}`, { method: "DELETE" }), await reload())) }, "✕"),
 										],
 								),
 							);

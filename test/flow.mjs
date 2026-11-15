@@ -16,6 +16,11 @@ const ok = async (p, status = 200) => {
 };
 const day = (n) => new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
 const step = (s) => console.log(`  ok    ${s}`);
+const mockTasks = async () => (await fetch(`${mock}/__tasks`)).json();
+const mt = async (id) => (await mockTasks()).find((t) => t.id === id);
+// A sync waits for the pushes queued before it, so after it timesheet.io has every change made so far.
+const settle = () => ok(m("POST", "/timesheet/sync"));
+const entryBy = async (pred, qs = "from=2000-01-01") => (await ok(m("GET", `/time?${qs}`))).data.find(pred);
 
 for (const [code, name, type, kind] of [["1000", "Chequing", "asset", "chequing"], ["1200", "Accounts receivable", "asset"], ["2300", "Payroll liabilities", "liability"], ["4100", "Service revenue", "revenue"], ["5200", "Wages", "expense"], ["5210", "Employer payroll costs", "expense"]]) {
 	const r = await call("POST", "/api/v1/accounts", { code, name, type, currency: "CAD", ...(kind ? { kind } : {}) });
@@ -39,15 +44,17 @@ step("employees, customer, project and manual time");
 await ok(m("POST", "/timesheet/sync"), 409);
 await ok(call("PUT", "/api/v1/modules/employees/settings", { values: { timesheet_api_key: "ts_wrong.key1" } }));
 await ok(m("POST", "/timesheet/test"), 409);
-await ok(call("PUT", "/api/v1/modules/employees/settings", { values: { timesheet_api_key: "ts_test.secret123" } }));
+await ok(call("PUT", "/api/v1/modules/employees/settings", { values: { timesheet_api_key: "ts_test.secret123", timesheet_time_zone: "Europe/Berlin" } }));
 assert.equal((await ok(m("POST", "/timesheet/test"))).account, "Ana Silva · ana@example.com");
 const s1 = await ok(m("POST", "/timesheet/sync"));
 assert.equal(s1.added, 124, s1.summary);
 assert.equal(s1.skipped, 1);
 assert.equal(s1.employees, 1); // Ben is new; Ana matched by email
 assert.equal(s1.projects, 2);
+assert.equal(s1.ledger_only, 1); // the hand-entered time on Audit, a project timesheet.io doesn't have
+assert.match((await entryBy((t) => t.id === e1.id)).push_error, /Audit isn't in timesheet.io/);
 const s2 = await ok(m("POST", "/timesheet/sync"));
-assert.deepEqual([s2.added, s2.updated, s2.removed], [0, 0, 0], s2.summary);
+assert.deepEqual([s2.added, s2.updated, s2.removed, s2.sent], [0, 0, 0, 0], s2.summary);
 const emps = (await ok(m("GET", "/employees"))).data;
 assert.equal(emps.find((e) => e.id === ana.id).timesheet_user_id, "u-ana");
 const ben = emps.find((e) => e.name === "Ben Okafor");
@@ -60,12 +67,43 @@ const acme = await ok(m("POST", "/customers", { name: "Acme Corp" }), 201);
 await ok(m("PATCH", `/projects/${web.id}`, { customer_entity_id: acme.id }));
 const t2 = (await ok(m("GET", `/time?from=${day(3)}`))).data.find((t) => t.description === "Task t2");
 assert.equal(t2.minutes, 420); // 8 h minus a 1 h break
-await ok(m("PATCH", `/time/${t2.id}`, { minutes: 5 }), 409);
-await ok(m("DELETE", `/time/${t2.id}`), 409);
 const calDays = (await ok(m("GET", `/calendar?from=${day(3)}&to=${day(3)}`))).data;
 assert.deepEqual(calDays.map((r) => [r.employee_name, r.minutes, r.billable_minutes]), [["Ana S.", 180, 180]]);
 await ok(m("GET", "/calendar?from=2020-01-01&to=2026-01-01"), 422);
 step("timesheet.io sync (2 pages, idempotent, matches people by email)");
+
+// Option 3: entries from timesheet.io are edited and deleted in Ledger, and the change is sent there
+await ok(m("PATCH", `/time/${t2.id}`, { description: "Edited in Ledger" }));
+const b5 = await entryBy((t) => t.description === "Task bulk5");
+await ok(m("PATCH", `/time/${b5.id}`, { work_date: day(30) }));
+const b7 = await entryBy((t) => t.description === "Task bulk7");
+await ok(m("DELETE", `/time/${b7.id}`), 204);
+await settle();
+const mt2 = await mt("t2");
+assert.equal(mt2.description, "Edited in Ledger");
+assert.deepEqual([mt2.startDateTime, mt2.endDateTime], [`${day(2)}T09:00:00+02:00`, `${day(2)}T17:00:00+02:00`]); // times kept as they were
+assert.equal((await mt("bulk5")).startDateTime, `${day(30)}T06:00:00+02:00`);
+assert.equal((await mt("bulk5")).endDateTime, `${day(30)}T06:30:00+02:00`);
+assert.equal((await mt("bulk7")).deleted, true);
+assert.equal((await entryBy((t) => t.id === t2.id)).push_status, "synced");
+step("Ledger edits and deletions of timesheet.io time are sent there");
+
+// Option 1: time entered in Ledger becomes a task in timesheet.io, for the right person
+const ops = (await ok(m("GET", "/projects"))).data.find((p) => p.timesheet_project_id === "p-ops");
+const hand = await ok(m("POST", "/time", { employee_id: ana.id, project_id: ops.id, work_date: day(6), minutes: 60, description: "Hand-entered" }), 201);
+await settle();
+let made = (await mockTasks()).find((t) => t.description === "Hand-entered" && !t.deleted);
+assert.equal(made.user, "u-ana");
+assert.equal(made.project.id, "p-ops");
+assert.deepEqual([made.startDateTime, made.endDateTime], [`${day(6)}T09:00:00+01:00`, `${day(6)}T10:00:00+01:00`]); // 9:00 in Europe/Berlin
+const s2b = await settle();
+assert.deepEqual([s2b.added, s2b.sent], [0, 0], s2b.summary); // its own task isn't pulled back as new
+await ok(m("PATCH", `/time/${hand.id}`, { employee_id: ben.id })); // moved: made again under Ben
+await settle();
+assert.equal((await mockTasks()).find((t) => t.id === made.id).deleted, true);
+made = (await mockTasks()).find((t) => t.description === "Hand-entered" && !t.deleted);
+assert.equal(made.user, "u-ben");
+step("hand-entered time sent to timesheet.io (and moved between people)");
 
 // Billing
 await ok(m("POST", "/billings", { customer_entity_id: acme.id, period_start: day(30), period_end: day(0) }), 422); // no accounts chosen yet
@@ -81,31 +119,51 @@ await ok(m("PATCH", `/time/${t2.id}`, { bill_rate_cents: 1 }), 409);
 const globex = await ok(m("POST", "/billings", { customer_entity_id: cust.id, period_start: day(30), period_end: day(0) }), 201);
 assert.equal(globex.total_cents, 30000); // 2 h at the project's 150.00
 assert.equal((await ok(m("GET", `/billings/${bill.id}`))).lines.length, 3);
-step("billable hours billed and posted, linked to the customer");
+await settle();
+for (const id of ["t1", "t2", "t4"]) assert.equal((await mt(id)).billed, true, id);
+assert.equal((await mt("t3")).billed, false);
+step("billable hours billed and posted, linked to the customer; billed in timesheet.io");
 
-// A change in timesheet.io after billing is not applied; an unbilled one is
-const tasks = await (await fetch(`${mock}/v1/tasks/search`, { method: "POST", headers: { Authorization: "ApiKey ts_test.secret123" }, body: JSON.stringify({ startDate: "2000-01-01", limit: 1000 }) })).json();
-const changed = tasks.items.map((t) => (t.id === "t1" ? { ...t, description: "changed", lastUpdate: 2000 } : t.id === "t3" ? { ...t, endDateTime: t.endDateTime.replace("11:30", "12:30"), lastUpdate: 2000 } : t)).filter((t) => t.id !== "bulk0");
+// Ledger wins: a change not yet sent (timesheet.io refuses the key meanwhile) and billed time keep Ledger's version
+const b9 = await entryBy((t) => t.description === "Task bulk9");
+await ok(call("PUT", "/api/v1/modules/employees/settings", { values: { timesheet_api_key: "ts_wrong.key1" } }));
+await ok(m("PATCH", `/time/${b9.id}`, { description: "Ledger wins" }));
+await ok(m("POST", "/timesheet/sync"), 409);
+assert.equal((await entryBy((t) => t.id === b9.id)).push_status, "pending");
+const changed = (await mockTasks())
+	.map((t) =>
+		t.id === "t1" ? { ...t, description: "changed in timesheet.io", lastUpdate: 999901 }
+		: t.id === "t3" ? { ...t, endDateTime: t.endDateTime.replace("11:30", "12:30"), lastUpdate: 999902 }
+		: t.id === "bulk9" ? { ...t, description: "changed in timesheet.io", lastUpdate: 999903 }
+		: t,
+	)
+	.filter((t) => t.id !== "bulk0");
 await fetch(`${mock}/__tasks`, { method: "POST", body: JSON.stringify(changed) });
-const s3 = await ok(m("POST", "/timesheet/sync"));
-assert.deepEqual([s3.added, s3.updated, s3.removed, s3.locked], [0, 1, 1, 1], s3.summary);
-step("sync leaves billed time alone, updates and removes the rest");
+await ok(call("PUT", "/api/v1/modules/employees/settings", { values: { timesheet_api_key: "ts_test.secret123" } }));
+const s3 = await settle();
+assert.deepEqual([s3.added, s3.updated, s3.removed, s3.kept, s3.sent], [0, 1, 1, 1, 2], s3.summary);
+assert.equal((await mt("t1")).description, "Task t1"); // billed here: Ledger's version sent back
+assert.equal((await mt("bulk9")).description, "Ledger wins");
+assert.equal((await entryBy((t) => t.description === "Task t3")).minutes, 150); // only changed there: taken
+step("changed in both places: Ledger wins; changed only in timesheet.io: taken");
 
 await ok(m("POST", `/billings/${bill.id}/reverse`));
 await ok(m("POST", `/billings/${bill.id}/reverse`), 409);
 assert.equal((await ok(call("GET", `/api/v1/journal-entries/${bill.journal_entry_id}`))).reversed_by_id !== null, true);
 assert.equal((await ok(m("GET", "/time?show=billable"))).data.length, 3);
-step("billing reversed; hours billable again");
+await settle();
+assert.equal((await mt("t1")).billed, false);
+step("billing reversed; hours billable again, and not billed in timesheet.io");
 
 // Payroll
 await ok(m("POST", "/pay-runs", { period_start: "2020-01-01", period_end: "2019-01-01" }), 422);
 const run = await ok(m("POST", "/pay-runs", { period_start: day(40), period_end: day(0), pay_date: day(0) }), 201);
 const line = (n) => run.lines.find((l) => l.employee_name === n);
-// Ana: 2 h manual + 3 h + 7 h + 119 × 0.5 h = 71.5 h at 40.00
-assert.equal(line("Ana S.").minutes, 71.5 * 60);
-assert.equal(line("Ana S.").gross_cents, 286000);
-assert.equal(line("Ana S.").deductions_cents, 30030);
-assert.equal(line("Ben Okafor").gross_cents, 4.5 * 5000);
+// Ana: 2 h manual + 3 h + 7 h + 118 × 0.5 h = 71 h at 40.00; Ben: 2.5 h + 2 h + the 1 h moved to him
+assert.equal(line("Ana S.").minutes, 71 * 60);
+assert.equal(line("Ana S.").gross_cents, 284000);
+assert.equal(line("Ana S.").deductions_cents, 29820);
+assert.equal(line("Ben Okafor").gross_cents, 5.5 * 5000);
 assert.equal(line("Cleo Park").gross_cents, 300000);
 assert.equal(line("Cleo Park").employer_cost_cents, 15000);
 await ok(m("POST", "/pay-runs", { period_start: day(40), period_end: day(0) }), 201).then((r) => assert.equal(r.lines.length, 1) || ok(m("DELETE", `/pay-runs/${r.id}`), 204)); // only the salary again: hours are claimed
@@ -124,9 +182,14 @@ assert.equal(amt("1000", "credit_cents"), Number(edited.net_cents));
 await ok(m("POST", `/pay-runs/${run.id}/post`, { paid_from_account: "1000" }), 409);
 await ok(m("DELETE", `/pay-runs/${run.id}`), 409);
 assert.equal((await ok(m("GET", "/time?show=unpaid"))).data.length, 0);
+await settle();
+assert.equal((await mt("bulk3")).paid, true);
+assert.equal(made.id && (await mt(made.id)).paid, true);
 await ok(m("POST", `/pay-runs/${run.id}/reverse`));
 assert.ok((await ok(m("GET", "/time?show=unpaid"))).data.length > 100);
-step("pay run drafted, edited, posted (balanced entry) and reversed");
+await settle();
+assert.equal((await mt("bulk3")).paid, false);
+step("pay run drafted, edited, posted (balanced entry) and reversed; paid in timesheet.io and back");
 
 const sum = await ok(m("GET", "/summary"));
 assert.equal(sum.accounts.wages_expense_account, "5200");
