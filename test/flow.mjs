@@ -20,9 +20,18 @@ const mockTasks = async () => (await fetch(`${mock}/__tasks`)).json();
 const mt = async (id) => (await mockTasks()).find((t) => t.id === id);
 // A sync waits for the pushes queued before it, so after it timesheet.io has every change made so far.
 const settle = () => ok(m("POST", "/timesheet/sync"));
+// What the Sales module offers a customer as billable items (server/billable.mjs there): debits on a
+// billable items account, on entries tagged with the customer, neither reversed nor a reversal.
+const salesItems = async (entityId, code = "1250") => {
+	const r = await ok(call("GET", `/api/v1/journal-entries?account_code=${code}&limit=500`));
+	const entries = Array.isArray(r) ? r : r.data;
+	return entries
+		.filter((e) => String(e.entity?.id ?? "") === String(entityId) && e.reverses_id == null && e.reversed_by_id == null)
+		.flatMap((e) => e.lines.filter((l) => l.account_code === code && Number(l.debit_cents) > 0).map((l) => ({ memo: l.memo || e.description, cents: Number(l.debit_cents) })));
+};
 const entryBy = async (pred, qs = "from=2000-01-01") => (await ok(m("GET", `/time?${qs}`))).data.find(pred);
 
-for (const [code, name, type, kind] of [["1000", "Chequing", "asset", "chequing"], ["1200", "Accounts receivable", "asset"], ["2300", "Payroll liabilities", "liability"], ["4100", "Service revenue", "revenue"], ["5200", "Wages", "expense"], ["5210", "Employer payroll costs", "expense"]]) {
+for (const [code, name, type, kind] of [["1000", "Chequing", "asset", "chequing"], ["1200", "Accounts receivable", "asset"], ["1250", "Unbilled billable hours", "asset"], ["2300", "Payroll liabilities", "liability"], ["4100", "Service revenue", "revenue"], ["5200", "Wages", "expense"], ["5210", "Employer payroll costs", "expense"]]) {
 	const r = await call("POST", "/api/v1/accounts", { code, name, type, currency: "CAD", ...(kind ? { kind } : {}) });
 	assert.ok(r.status === 201 || r.status === 409, JSON.stringify(r.body));
 }
@@ -107,7 +116,7 @@ step("hand-entered time sent to timesheet.io (and moved between people)");
 
 // Billing
 await ok(m("POST", "/billings", { customer_entity_id: acme.id, period_start: day(30), period_end: day(0) }), 422); // no accounts chosen yet
-const bill = await ok(m("POST", "/billings", { customer_entity_id: acme.id, period_start: day(30), period_end: day(0), receivable_account: "1200", revenue_account: "4100" }), 201);
+const bill = await ok(m("POST", "/billings", { customer_entity_id: acme.id, period_start: day(30), period_end: day(0), billable_hours_account: "1250", revenue_account: "4100" }), 201);
 assert.equal(bill.total_minutes, 180 + 420 + 120);
 assert.equal(bill.total_cents, 12 * 12000);
 assert.equal(bill.status, "posted");
@@ -116,12 +125,16 @@ const billedT2 = await entryBy((t) => t.id === t2.id);
 assert.ok(billedT2.billing_journal_entry_id);
 const entry = await ok(call("GET", `/api/v1/journal-entries/${billedT2.billing_journal_entry_id}`));
 assert.equal(entry.entity?.name, "Acme Corp");
-assert.deepEqual(entry.lines.map((l) => [l.account_code, Number(l.debit_cents), Number(l.credit_cents)]), [["1200", 84000, 0], ["4100", 0, 84000]]); // 7 h at 120.00
+assert.deepEqual(entry.lines.map((l) => [l.account_code, Number(l.debit_cents), Number(l.credit_cents)]), [["1250", 84000, 0], ["4100", 0, 84000]]); // 7 h at 120.00
+assert.equal(entry.lines[0].memo, `${day(2)} · Ana S. · 7.00 h × 120.00 · Website rebuild: Edited in Ledger`);
+const acmeItems = await salesItems(acme.id);
+assert.deepEqual(acmeItems.map((i) => i.cents).sort(), [24000, 36000, 84000]); // one item per time entry, for Sales to invoice
 assert.deepEqual(entry.links.map((l) => [l.module_id, l.ref, l.label]).sort(), [["employees", "billed", "Billed"], ["employees", `time:${t2.id}`, `Hours ${day(2)} · Ana S. · 7.00 h`]]);
 await ok(m("POST", "/billings", { customer_entity_id: acme.id, period_start: day(30), period_end: day(0) }), 422); // nothing left (accounts now remembered)
 await ok(m("PATCH", `/time/${t2.id}`, { bill_rate_cents: 1 }), 409);
 const globex = await ok(m("POST", "/billings", { customer_entity_id: cust.id, period_start: day(30), period_end: day(0) }), 201);
 assert.equal(globex.total_cents, 30000); // 2 h at the project's 150.00
+assert.deepEqual(await salesItems(cust.id), [{ memo: `${day(4)} · Ana S. · 2.00 h × 150.00 · Audit: Review`, cents: 30000 }]);
 assert.equal((await ok(m("GET", `/billings/${bill.id}`))).lines.length, 3);
 await settle();
 for (const id of ["t1", "t2", "t4"]) assert.equal((await mt(id)).billed, true, id);
@@ -158,6 +171,7 @@ assert.equal((await ok(m("GET", "/time?show=billable"))).data.length, 3);
 await settle();
 assert.equal((await mt("t1")).billed, false);
 assert.equal((await ok(call("GET", `/api/v1/journal-entries/${billedT2.billing_journal_entry_id}`))).links.some((l) => l.ref === "billed"), false); // reversed: no longer tagged Billed
+assert.deepEqual(await salesItems(acme.id), []); // reversed: no longer offered for invoicing
 step("billing reversed; hours billable again, and not billed in timesheet.io");
 
 // Batch: bill chosen time entries at once; what can't be billed is skipped with the reason

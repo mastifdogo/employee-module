@@ -16,9 +16,10 @@ newer). Install it under **Settings → Modules** by entering this repository's
   to open its time entries.
 - **Billable hours**: unbilled billable hours grouped by customer. Tick time
   entries (one by one, a whole customer, or across customers) and press
-  *Bill chosen*. **Each time entry posts its own transaction**: debit accounts
-  receivable, credit the billable hours account, with the customer on it and
-  tagged **Billed** (see *For other modules* below). Billed time can be ticked
+  *Bill chosen*. **Each time entry posts its own transaction**: debit the
+  billable hours account, credit revenue, with the customer on it and tagged
+  **Billed**. Sales picks these up as billable items (see *Invoicing billed
+  hours* below). Billed time can be ticked
   and unbilled the same way, which reverses those transactions and makes the
   hours billable again. A batch makes one billing per customer; a billing can
   be opened (with a CSV of its lines for the invoice) or reversed as a whole.
@@ -45,19 +46,36 @@ newer). Install it under **Settings → Modules** by entering this repository's
 start as a percentage you set on each employee and are yours to correct on
 every pay run. Use your payroll provider's or tax authority's figures.
 
-## For other modules
+## Invoicing billed hours
 
-Every billed time entry is one journal entry, so another module (an invoicing
-module, say) can find billed hours without reading this module's tables:
+Every billed time entry is one journal entry: a **debit to the billable hours
+account** (Settings → Employees) and a credit to revenue, with the customer as
+the entry's entity. In the **Sales** module:
+
+1. Under **Settings → Sales**, add the billable hours account as one of the
+   *Billable items* accounts.
+2. On a customer's new invoice, **+ Billable items** lists their billed hours,
+   one per time entry (date, person, hours × rate, project and task); tick
+   them and add them as one line or each as its own line.
+3. Give those invoice lines a category whose account is the **billable hours
+   account**. The invoice then moves the hours from unbilled to receivable;
+   the revenue was already counted when they were billed here.
+
+Any other module finds billed hours the same way, without reading this
+module's tables:
 
 - list the entries of the billable hours account
-  (`ctx.ledger.listJournalEntries({ accountCode })`);
+  (`ctx.ledger.listJournalEntries({ accountCode })`) and take the debit lines
+  on it;
 - the customer is the entry's `entity` (`{ id, name }`);
 - the entry carries the tag link `{ module_id: "employees", ref: "billed",
   label: "Billed" }`, plus `{ ref: "time:<id>" }` naming the time entry
   (label: date, person and hours; it opens the billing here);
-- the reference is `HOURS-<time entry id>`, the credit line's memo is the
-  project and what was done.
+- the reference is `HOURS-<time entry id>`; both lines' memo is the item:
+  `2026-11-12 · Ana Silva · 7.00 h × 120.00 · Website rebuild: Task t2`.
+
+Billings made in 0.4.0 debited accounts receivable instead; they stay as
+posted (unbilling one reverses it as usual).
 
 An unbilled entry is reversed (`reversed_by_id` is set) and loses its Billed
 tag. Billings made before 0.4.0 are one entry for the whole billing; they get

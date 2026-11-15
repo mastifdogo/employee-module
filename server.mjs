@@ -311,9 +311,10 @@ export default async function register(ctx) {
 	});
 
 	// ---- billings: bill customers for billable hours ---------------------------------
-	// Each billed time entry posts its own journal entry: debit accounts receivable, credit the
-	// billable hours account, with the customer as the entry's entity. Other modules find it by its
-	// tag, a link on the entry with ref "billed" (label "Billed"), and by the customer on it.
+	// Each billed time entry posts its own journal entry: debit the billable hours account (with the
+	// details in the line's memo), credit revenue, with the customer as the entry's entity. An invoicing
+	// module picks those debits up as the customer's billable items (Sales: Settings → Sales → Billable
+	// items accounts); it also finds them by the link with ref "billed" (label "Billed").
 	const BILLED_TAG = { ref: "billed", label: "Billed" };
 	const BILL = `id, customer_entity_id, customer_name, period_start, period_end, billing_date, currency, total_minutes, total_cents, status, journal_entry_id, created_by, created_at, reversed_by, reversed_at`;
 	const idList = (v, name) => {
@@ -458,8 +459,9 @@ export default async function register(ctx) {
 							reference: `HOURS-${c.id}`,
 							entity_id: entity.id,
 							lines: [
-								{ account_code: acc.receivable_account, debit_cents: c.amount },
-								{ account_code: acc.revenue_account, credit_cents: c.amount, memo: [t.project_name, t.description].filter(Boolean).join(": ").slice(0, 500) || undefined },
+								// What an invoice line shows for this item: the line's memo.
+								{ account_code: acc.billable_hours_account, debit_cents: c.amount, memo: itemMemo(t, c) },
+								{ account_code: acc.revenue_account, credit_cents: c.amount, memo: itemMemo(t, c) },
 							],
 							links: [
 								{ ref: `time:${c.id}`, label: `Hours ${t.work_date} · ${t.employee_name} · ${hours(c.minutes)} h`.slice(0, 200), href: billingHref(billingId) },
@@ -497,11 +499,16 @@ export default async function register(ctx) {
 		return { billings, billed, total_cents: total, skipped };
 	}
 
+	const money2 = (cents) => (Number(cents) / 100).toFixed(2);
+	/** "2026-11-12 · Ana Silva · 7.00 h × 120.00 · Website rebuild: Task t2", the item an invoice shows. */
+	const itemMemo = (t, c) =>
+		[t.work_date, t.employee_name, `${hours(c.minutes)} h × ${money2(t.rate)}`, [t.project_name, t.description].filter(Boolean).join(": ")].filter(Boolean).join(" · ").slice(0, 500);
+
 	async function billingSetup(b) {
 		const settings = await ctx.settings.get();
 		return {
 			billingDate: b.billing_date === undefined ? today() : reqDate(b.billing_date, "billing date"),
-			acc: await pickAccounts(b, settings, { receivable_account: "accounts receivable account", revenue_account: "billable hours account" }),
+			acc: await pickAccounts(b, settings, { billable_hours_account: "billable hours account", revenue_account: "revenue account for billed hours" }),
 			currency: currencyOf(settings),
 		};
 	}
@@ -1129,7 +1136,7 @@ export default async function register(ctx) {
 			...rows[0],
 			role: req.user.role,
 			currency: currencyOf(s),
-			accounts: Object.fromEntries(["wages_expense_account", "employer_cost_account", "payroll_liabilities_account", "receivable_account", "revenue_account"].map((k) => [k, s[k] || null])),
+			accounts: Object.fromEntries(["wages_expense_account", "employer_cost_account", "payroll_liabilities_account", "billable_hours_account", "revenue_account"].map((k) => [k, s[k] || null])),
 			timesheet: { configured: Boolean(s.timesheet_api_key), auto_sync: s.timesheet_auto_sync === true, last_sync: await lastSync() },
 		};
 	});
