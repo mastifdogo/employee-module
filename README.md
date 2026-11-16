@@ -47,6 +47,18 @@ newer). Install it under **Settings → Modules** by entering this repository's
 start as a percentage you set on each employee and are yours to correct on
 every pay run. Use your payroll provider's or tax authority's figures.
 
+## Root mode
+
+In Ledger's root mode (Ledger ≥ 0.21.1, admins only) the page shows red
+**Root** buttons that reach records the module normally protects: edit or
+delete a billed or paid time entry, delete any billing or pay run (its hours
+become billable or unpaid again), and change the amounts of a posted pay
+run. Ledger keeps everything these change and can put it back from Settings →
+Root log. They change only the module's records: journal entries stay in the
+books (delete those on the entry's page) and nothing is sent to timesheet.io.
+Root mode can't be left while a posted pay run has no lines or time sits on a
+reversed billing or pay run.
+
 ## Invoicing billed hours
 
 The first time hours are billed, Ledger makes the module's **clearing

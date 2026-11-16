@@ -283,6 +283,16 @@ export default async function register(ctx) {
 		return rows[0];
 	}
 
+	// Root: change any entry, billed or paid too, through ctx.root (logged and reversible; not sent to timesheet.io).
+	ctx.route("PATCH", "/time/:id/root", async (req) => {
+		const id = paramId(req, "time entry");
+		const { rowCount } = await q(`SELECT 1 FROM ${S}.time_entries WHERE id = $1`, [id]);
+		if (!rowCount) throw new ctx.HttpError(404, "no such time entry");
+		const f = await timeFields(body(req), true);
+		if (Object.keys(f).length === 0) throw bad("nothing to change");
+		return ctx.root.update(req, "time_entries", id, { ...f, updated_at: new Date().toISOString() }, `Employees: changed time entry ${id} (${Object.keys(f).join(", ")})`);
+	});
+
 	ctx.route("PATCH", "/time/:id", async (req) => {
 		const id = paramId(req, "time entry");
 		const entry = await openEntry(id);
@@ -303,6 +313,12 @@ export default async function register(ctx) {
 
 	ctx.route("DELETE", "/time/:id", async (req) => {
 		const id = paramId(req, "time entry");
+		if (req.user.root) {
+			// Root: any entry, billed or paid too, kept by Ledger so it can be put back. timesheet.io and the books are left alone.
+			const { rows } = await q(`SELECT t.work_date, t.minutes, e.name FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id WHERE t.id = $1`, [id]);
+			if (rows.length === 0) throw new ctx.HttpError(404, "no such time entry");
+			return ctx.root.remove(req, "time_entries", id, `Employees: deleted ${hours(rows[0].minutes)} h of ${rows[0].name} on ${rows[0].work_date} (time entry ${id})`);
+		}
 		const entry = await openEntry(id);
 		// Its task in timesheet.io is deleted too (queued, so a failed call is retried).
 		const { rows: gone } = await q(
@@ -631,6 +647,16 @@ export default async function register(ctx) {
 		return { unbilled, skipped };
 	});
 
+	ctx.route("DELETE", "/billings/:id", async (req) => {
+		const id = paramId(req, "billing");
+		if (!req.user.root) throw new ctx.HttpError(403, "Only root mode deletes a billing. Reverse it instead.");
+		const { rows } = await q(`SELECT status, customer_name FROM ${S}.billings WHERE id = $1`, [id]);
+		if (rows.length === 0) throw new ctx.HttpError(404, "no such billing");
+		for (const t of (await q(`SELECT id FROM ${S}.time_entries WHERE billing_id = $1`, [id])).rows)
+			await ctx.root.update(req, "time_entries", t.id, { billing_id: null, billed_rate_cents: null, billed_amount_cents: null, billing_journal_entry_id: null });
+		return ctx.root.remove(req, "billings", id, `Employees: deleted ${rows[0].status} billing ${id} · ${rows[0].customer_name}`);
+	});
+
 	ctx.route("POST", "/billings/:id/reverse", async (req) => {
 		const id = paramId(req, "billing");
 		const { rows } = await q(`SELECT ${BILL} FROM ${S}.billings WHERE id = $1`, [id]);
@@ -725,6 +751,14 @@ export default async function register(ctx) {
 			if (b[k] !== undefined) f[k] = cents(b[k], name);
 		const keys = Object.keys(f);
 		if (keys.length === 0) throw bad("nothing to change");
+		if (req.user.root) {
+			const { rows } = await q(`SELECT gross_cents, deductions_cents FROM ${S}.pay_run_lines WHERE id = $1 AND pay_run_id = $2`, [req.params.line, id]);
+			if (rows.length === 0) throw new ctx.HttpError(404, "no such line");
+			const gross = f.gross_cents ?? Number(rows[0].gross_cents);
+			if ((f.deductions_cents ?? Number(rows[0].deductions_cents)) > gross) throw bad("Deductions can't be more than gross pay.");
+			await ctx.root.update(req, "pay_run_lines", req.params.line, f, `Employees: changed a line of pay run ${id} (${keys.join(", ")})`);
+			return getRun(id);
+		}
 		try {
 			const { rowCount } = await q(
 				`UPDATE ${S}.pay_run_lines l SET ${keys.map((k, i) => `${k} = $${i + 3}`).join(", ")}
@@ -741,6 +775,14 @@ export default async function register(ctx) {
 
 	ctx.route("DELETE", "/pay-runs/:id", async (req) => {
 		const id = paramId(req, "pay run");
+		if (req.user.root) {
+			// Root: any pay run, posted too. Its lines first (a cascade wouldn't be kept), then its hours go back to unpaid; its journal entry stays.
+			const { rows } = await q(`SELECT status, period_start, period_end FROM ${S}.pay_runs WHERE id = $1`, [id]);
+			if (rows.length === 0) throw new ctx.HttpError(404, "no such pay run");
+			for (const l of (await q(`SELECT id FROM ${S}.pay_run_lines WHERE pay_run_id = $1`, [id])).rows) await ctx.root.remove(req, "pay_run_lines", l.id);
+			for (const t of (await q(`SELECT id FROM ${S}.time_entries WHERE pay_run_id = $1`, [id])).rows) await ctx.root.update(req, "time_entries", t.id, { pay_run_id: null });
+			return ctx.root.remove(req, "pay_runs", id, `Employees: deleted ${rows[0].status} pay run ${id} (${rows[0].period_start} to ${rows[0].period_end})`);
+		}
 		// Lines go with the run and its time entries become unpaid again (foreign keys).
 		const { rowCount } = await q(`DELETE FROM ${S}.pay_runs WHERE id = $1 AND status = 'draft'`, [id]);
 		if (rowCount === 0) throw new ctx.HttpError(409, "Only a draft pay run can be deleted. Reverse a posted one.");
@@ -1142,7 +1184,7 @@ export default async function register(ctx) {
 
 	// ---- overview, to-dos, search, import ---------------------------------------
 	ctx.route("GET", "/accounts", async () => {
-		const list = await ctx.ledger.listAccounts();
+		const list = (await ctx.ledger.listAccounts()).filter((a) => !a.hidden);
 		return { data: list.map((a) => ({ code: a.code, name: a.name, type: a.type, currency: a.currency, kind: a.kind ?? null, parent_code: a.parent_code ?? null })) };
 	});
 
@@ -1159,6 +1201,7 @@ export default async function register(ctx) {
 		return {
 			...rows[0],
 			role: req.user.role,
+			root: req.user.root === true,
 			currency: currencyOf(s),
 			accounts: Object.fromEntries(["wages_expense_account", "employer_cost_account", "payroll_liabilities_account"].map((k) => [k, s[k] || null])),
 			billable_hours: await billableAccountIfMade(currencyOf(s)),
@@ -1275,6 +1318,19 @@ export default async function register(ctx) {
 			})
 			.catch((e) => ctx.log.warn("could not tag older billings", { error: String(e?.message ?? e) }));
 	}, 5_000).unref();
+
+	// Records that can't work, which keep root mode from being left.
+	ctx.root.onCheck(async () => {
+		const { rows } = await q(
+			`SELECT 'pay run ' || r.id || ' is ' || r.status || ' but has no lines' AS problem FROM ${S}.pay_runs r
+				WHERE r.status <> 'draft' AND NOT EXISTS (SELECT 1 FROM ${S}.pay_run_lines l WHERE l.pay_run_id = r.id)
+			UNION ALL
+			SELECT 'time entry ' || t.id || ' is on reversed billing ' || b.id FROM ${S}.time_entries t JOIN ${S}.billings b ON b.id = t.billing_id WHERE b.status = 'reversed'
+			UNION ALL
+			SELECT 'time entry ' || t.id || ' is on reversed pay run ' || r.id FROM ${S}.time_entries t JOIN ${S}.pay_runs r ON r.id = t.pay_run_id WHERE r.status = 'reversed'`,
+		);
+		return rows.map((r) => `Employees: ${r.problem}.`);
+	});
 
 	// Hourly pull from timesheet.io, in every organization that turned it on.
 	setInterval(() => pullInBackground("timesheet.io (hourly)", (_org, s) => s.timesheet_auto_sync === true), 3_600_000).unref();

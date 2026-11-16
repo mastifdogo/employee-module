@@ -1,9 +1,9 @@
 {
   "id": "employees",
   "name": "Employees",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "Track employee time, bill customers for billable hours and run payroll, with time pulled from timesheet.io.",
-  "ledger": ">=0.20.0",
+  "ledger": ">=0.21.1",
   "server": "server.mjs",
   "ui": "ui",
   "nav": {

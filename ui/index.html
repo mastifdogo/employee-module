@@ -88,6 +88,7 @@
 	td.pick { width: 1.8rem; }
 	.pickhead { display: inline-flex; align-items: center; gap: 0.5rem; }
 	input[type="checkbox"] { accent-color: var(--accent); }
+	button.root { color: var(--danger); border-color: var(--danger); font-weight: 600; }
 	[hidden] { display: none !important; }
 </style>
 </head>
@@ -128,6 +129,9 @@
 	const $ = (id) => document.getElementById(id);
 	const st = { summary: null, employees: [], projects: [], customers: [], accounts: [], tab: "time" };
 	const canEdit = () => st.summary && st.summary.role !== "viewer";
+	// Root mode (the server says so): controls marked "Root" in red that reach any record, kept and reversible by Ledger.
+	const isRoot = () => st.summary?.root === true;
+	const rootButton = (label, onclick, title) => h("button", { class: "danger small root", title: title ?? "Root mode: Ledger keeps what this changes and can put it back", onclick }, `Root · ${label}`);
 	const cur = () => st.summary?.currency ?? "";
 	const money = (c) => `${(Number(c) / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 	const moneyC = (c) => `${money(c)} ${cur()}`;
@@ -432,6 +436,18 @@
 											" ",
 											h("button", { class: "danger small", title: "Delete", onclick: act(async () => confirm(`Delete ${hrs(t.minutes)} h of ${t.employee_name} on ${t.work_date}${t.in_timesheet ? ", here and in timesheet.io" : ""}?`) && (await api(`/time/${t.id}`, { method: "DELETE" }), await reload())) }, "✕"),
 										],
+									isRoot() &&
+										locked && [
+											rootButton("Edit", () => {
+												const f = entryForm(t);
+												dialog("Root: change time", f.node, "Save", async () => {
+													await send("PATCH", `/time/${t.id}/root`, f.read());
+													await reload();
+												});
+											}),
+											" ",
+											rootButton("Delete", act(async () => confirm(`Root: delete ${hrs(t.minutes)} h of ${t.employee_name} on ${t.work_date}, though it is billed or paid? Its journal entries stay in the books; the root log can put it back.`) && (await api(`/time/${t.id}`, { method: "DELETE" }), await reload()))),
+										],
 								),
 							);
 						}),
@@ -697,6 +713,8 @@
 									h("button", { class: "plain small", onclick: act(() => openBilling(b.id)) }, "Open"),
 									" ",
 									edit && b.status === "posted" && h("button", { class: "danger small", onclick: act(async () => confirm(`Reverse billing ${b.id} for ${b.customer_name}? Its transactions are reversed and the hours become billable again.`) && (await send("POST", `/billings/${b.id}/reverse`), await reload())) }, "Reverse"),
+									isRoot() && " ",
+									isRoot() && rootButton("Delete", act(async () => confirm(`Root: delete billing ${b.id} for ${b.customer_name}? Its hours become billable again; its transactions stay in the books. The root log can put it back.`) && (await api(`/billings/${b.id}`, { method: "DELETE" }), await reload()))),
 								),
 							),
 						),
@@ -763,9 +781,10 @@
 			throw e;
 		}
 		const draft = run.status === "draft" && canEdit();
+		const editable = draft || isRoot(); // root may correct a posted run's amounts
 		const back = () => ((openRun = null), Promise.all([showPayroll(), refreshSummary()]));
 		const amount = (line, key) =>
-			draft
+			editable
 				? h("input", {
 						class: "num",
 						inputmode: "decimal",
@@ -794,7 +813,8 @@
 			h(
 				"div",
 				{ class: "actions" },
-				draft && h("button", { class: "danger", onclick: act(async () => confirm("Delete this draft? Its hours go back to unpaid.") && (await api(`/pay-runs/${id}`, { method: "DELETE" }), await back())) }, "Delete draft"),
+				run.status === "draft" && canEdit() && !isRoot() && h("button", { class: "danger", onclick: act(async () => confirm("Delete this draft? Its hours go back to unpaid.") && (await api(`/pay-runs/${id}`, { method: "DELETE" }), await back())) }, "Delete draft"),
+				isRoot() && rootButton("Delete pay run", act(async () => confirm(`Root: delete ${run.status} pay run ${id}? Its hours go back to unpaid; its journal entry stays in the books. The root log can put it back.`) && (await api(`/pay-runs/${id}`, { method: "DELETE" }), await back()))),
 				draft &&
 					h(
 						"button",

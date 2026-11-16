@@ -132,6 +132,7 @@ assert.deepEqual(entry.lines.map((l) => [l.account_code, Number(l.debit_cents), 
 const billAcct = await ok(call("GET", `/api/v1/accounts/${BILLABLE}`));
 assert.deepEqual([billAcct.name, billAcct.type, billAcct.kind, billAcct.currency, Number(billAcct.balance_cents)], ["Billable hours", "asset", "clearing", "CAD", 0]);
 assert.equal(Number((await ok(call("GET", "/api/v1/accounts/4100"))).balance_cents), 0); // nothing is revenue yet
+assert.equal((await ok(m("GET", "/accounts"))).data.some((x) => x.code === BILLABLE), false); // hidden clearing account: not in pickers
 assert.equal((await ok(m("GET", "/summary"))).billable_hours.code, BILLABLE);
 assert.equal(entry.lines[0].memo, `${day(2)} · Ana S. · 7.00 h × 120.00 · Website rebuild: Edited in Ledger`);
 const acmeItems = await salesItems(acme.id);
@@ -240,6 +241,38 @@ assert.ok((await ok(m("GET", "/time?show=unpaid"))).data.length > 100);
 await settle();
 assert.equal((await mt("bulk3")).paid, false);
 step("pay run drafted, edited, posted (balanced entry) and reversed; paid in timesheet.io and back");
+
+// Root mode: any record, through ctx.root (kept by Ledger, reversible); the books and timesheet.io are left alone
+const globexBilled = (await ok(m("GET", "/billings"))).data.find((b) => b.customer_name === "Globex" && b.status === "posted");
+await ok(m("DELETE", `/billings/${globexBilled.id}`), 403); // not in root mode
+await ok(m("PATCH", `/time/${e1.id}/root`, { description: "x" }), 403);
+assert.equal((await ok(m("GET", "/summary"))).root, false);
+await ok(call("POST", "/api/v1/auth/root", { on: true }));
+assert.equal((await ok(m("GET", "/summary"))).root, true);
+assert.notEqual((await entryBy((t) => t.id === e1.id)).billing_id, null); // billed: normally locked
+await ok(m("PATCH", `/time/${e1.id}/root`, { description: "Changed in root mode" }));
+assert.equal((await entryBy((t) => t.id === e1.id)).description, "Changed in root mode");
+const globexEntry = (await entryBy((t) => t.id === e1.id)).billing_journal_entry_id;
+await ok(m("DELETE", `/billings/${globexBilled.id}`));
+assert.equal((await ok(m("GET", "/billings"))).data.some((b) => b.id === globexBilled.id), false);
+assert.equal((await entryBy((t) => t.id === e1.id)).billing_id, null); // billable again
+assert.equal((await ok(call("GET", `/api/v1/journal-entries/${globexEntry}`))).reversed_by_id, null); // its entry stays as it was
+const run2 = await ok(m("POST", "/pay-runs", { period_start: day(40), period_end: day(0), pay_date: day(0) }), 201);
+await ok(m("POST", `/pay-runs/${run2.id}/post`, { paid_from_account: "1000", wages_expense_account: "5200", payroll_liabilities_account: "2300", employer_cost_account: "5210" }));
+const benLine = run2.lines.find((l) => l.employee_name === "Ben Okafor");
+await ok(m("PATCH", `/pay-runs/${run2.id}/lines/${benLine.id}`, { gross_cents: 1000, deductions_cents: 2000 }), 422);
+const fixedRun = await ok(m("PATCH", `/pay-runs/${run2.id}/lines/${benLine.id}`, { gross_cents: 30000 })); // posted, changed in root mode
+assert.deepEqual([fixedRun.status, Number(fixedRun.lines.find((l) => l.id === benLine.id).gross_cents)], ["posted", 30000]);
+assert.equal((await ok(call("GET", "/api/v1/root/check"))).intact, true);
+await ok(m("DELETE", `/pay-runs/${run2.id}`));
+await ok(m("GET", `/pay-runs/${run2.id}`), 404);
+assert.ok((await ok(m("GET", "/time?show=unpaid"))).data.length > 100); // its hours are unpaid again
+const log = await ok(call("GET", "/api/v1/root-actions"));
+const logText = JSON.stringify(log);
+for (const want of [`deleted posted billing ${globexBilled.id}`, `deleted posted pay run ${run2.id}`, `changed time entry ${e1.id}`]) assert.ok(logText.includes(want), want);
+await ok(call("POST", "/api/v1/auth/root", { on: false }));
+assert.equal((await ok(m("GET", "/summary"))).root, false);
+step("root mode: billed time changed, a billing and a posted pay run deleted, all logged by Ledger");
 
 const sum = await ok(m("GET", "/summary"));
 assert.equal(sum.accounts.wages_expense_account, "5200");
