@@ -121,11 +121,14 @@ and every module (Ledger ≥ 0.23.0).
   posted or reversed because of a tag.
   - `billed` on an hours transaction: the hours are billed and locked here
     (and billed in timesheet.io); taken off, they are open again.
-  - `paid` on it: the hours show *paid*; taken off, they don't.
+  - `paid` on it: the hours show *paid* (and are paid in timesheet.io);
+    taken off, they aren't.
   - On a billing from before 0.12.0: `paid` shows on the billing, and
     `billed` taken off frees its hours as before.
 
-  Tags changed while Ledger was down are read again when the module starts.
+  Since 0.13.0 a `billed` or `paid` tag set or taken off is sent to
+  timesheet.io straight away, not at the next sync. Tags changed while Ledger
+  was down are read again when the module starts, and sent then.
 
 ## timesheet.io
 
@@ -169,8 +172,11 @@ The sync goes both ways.
 - edits and deletions made in Ledger are sent, including to entries that came
   from timesheet.io. A task keeps its time of day and breaks; only the day and
   the end move when you change them;
-- billing hours marks their tasks **billed**, posting a pay run marks them
-  **paid**, and reversing either undoes it.
+- the shared tags go back to timesheet.io as soon as they change: a `billed`
+  tag on the hours' transaction (Sales invoicing them, or a person) marks
+  their task **billed**, a `paid` tag (the customer paid) marks it **paid**,
+  and taking either off undoes it. Billing hours here marks them billed and
+  posting a pay run marks them paid as well, and reversing either undoes it.
 
 **Ledger wins.** A change made in Ledger that isn't sent yet, and any hours that
 are billed or on a pay run, are never overwritten from timesheet.io: Ledger's

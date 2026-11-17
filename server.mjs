@@ -968,7 +968,10 @@ export default async function register(ctx) {
 	}
 	/** Sends Ledger's changes to timesheet.io after the request answers (one queued push per organization). */
 	function pushSoon(req) {
-		const orgId = req.user.organization?.id ?? 1;
+		pushSoonIn(req.user.organization?.id ?? 1);
+	}
+	/** The same for an organization by id (tag changes and startup have no request). */
+	function pushSoonIn(orgId) {
 		if (queuedPush.has(orgId)) return;
 		queuedPush.add(orgId);
 		serial(orgId, async () => {
@@ -1023,9 +1026,11 @@ export default async function register(ctx) {
 			`SELECT t.id, t.work_date, t.minutes, t.description, t.billable, t.updated_at::text AS updated_stamp, t.timesheet_task_id, t.timesheet_task_user_id,
 				t.timesheet_start, t.timesheet_end, t.timesheet_break_seconds,
 				e.name AS employee_name, e.timesheet_user_id, p.name AS project_name, p.timesheet_project_id,
-				(t.billing_id IS NOT NULL OR t.billed_tag_entry_id IS NOT NULL) AS billed, COALESCE(r.status = 'posted', false) AS paid
+				(t.billing_id IS NOT NULL OR t.billed_tag_entry_id IS NOT NULL) AS billed,
+				-- paid: its transaction carries the shared tag "paid" (the customer paid), or a posted pay run paid it
+				(t.billing_paid OR COALESCE(b.entry_paid AND b.status = 'posted', false) OR COALESCE(r.status = 'posted', false)) AS paid
 			FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id
-			LEFT JOIN ${S}.projects p ON p.id = t.project_id LEFT JOIN ${S}.pay_runs r ON r.id = t.pay_run_id
+			LEFT JOIN ${S}.projects p ON p.id = t.project_id LEFT JOIN ${S}.pay_runs r ON r.id = t.pay_run_id LEFT JOIN ${S}.billings b ON b.id = t.billing_id
 			WHERE t.push_status IN ('pending', 'failed')
 				OR (t.push_status = 'ledger_only' AND e.timesheet_user_id IS NOT NULL AND p.timesheet_project_id IS NOT NULL)
 			ORDER BY t.id LIMIT 500`,
@@ -1434,10 +1439,14 @@ export default async function register(ctx) {
 		const entryId = c.entry_id;
 		if (c.tag === "paid") {
 			// Shown on the billing, read-only: the module doesn't take payments.
+			// The hours' tasks in timesheet.io are marked paid (or not) to match.
 			const paid = c.action === "set";
-			await q(`UPDATE ${S}.time_entries SET billing_paid = $2 WHERE billing_journal_entry_id = $1 AND billing_id IS NOT NULL AND billing_paid <> $2`, [entryId, paid]);
-			await q(`UPDATE ${S}.time_entries SET billing_paid = $2 WHERE clearing_entry_id = $1 AND billing_paid <> $2`, [entryId, paid]);
-			await q(`UPDATE ${S}.billings SET entry_paid = $2 WHERE journal_entry_id = $1 AND status = 'posted' AND entry_paid <> $2`, [entryId, paid]);
+			const SEND = `push_status = 'pending', push_error = '', updated_at = now()`;
+			const a = await q(`UPDATE ${S}.time_entries SET billing_paid = $2, ${SEND} WHERE billing_journal_entry_id = $1 AND billing_id IS NOT NULL AND billing_paid <> $2`, [entryId, paid]);
+			const b = await q(`UPDATE ${S}.time_entries SET billing_paid = $2, ${SEND} WHERE clearing_entry_id = $1 AND billing_paid <> $2`, [entryId, paid]);
+			const old = await q(`UPDATE ${S}.billings SET entry_paid = $2 WHERE journal_entry_id = $1 AND status = 'posted' AND entry_paid <> $2 RETURNING id`, [entryId, paid]);
+			if (old.rows.length) await q(`UPDATE ${S}.time_entries SET ${SEND} WHERE billing_id = ANY($1::bigint[])`, [old.rows.map((r) => r.id)]);
+			if (a.rowCount || b.rowCount || old.rows.length) await pushTagChange();
 			return;
 		}
 		if (c.tag !== "billed") return;
@@ -1448,16 +1457,19 @@ export default async function register(ctx) {
 			if (own.rowCount || old.rowCount) return;
 			// On an entry this module posted for hours that aren't billed here: they are billed, so not offered again.
 			const ids = await timeEntriesOf(entryId);
-			if (ids.length)
-				await q(
+			if (ids.length) {
+				const { rowCount } = await q(
 					`UPDATE ${S}.time_entries SET billed_tag_entry_id = $1, push_status = 'pending', push_error = '', updated_at = now()
 					WHERE id = ANY($2::bigint[]) AND billing_id IS NULL AND billed_tag_entry_id IS NULL`,
 					[entryId, ids],
 				);
+				if (rowCount) await pushTagChange(); // billed in timesheet.io too
+			}
 			return;
 		}
 		// "billed" taken off: hours someone else had marked billed are billable again...
-		await q(`UPDATE ${S}.time_entries SET billed_tag_entry_id = NULL, push_status = 'pending', push_error = '', updated_at = now() WHERE billed_tag_entry_id = $1`, [entryId]);
+		const freed = await q(`UPDATE ${S}.time_entries SET billed_tag_entry_id = NULL, push_status = 'pending', push_error = '', updated_at = now() WHERE billed_tag_entry_id = $1`, [entryId]);
+		if (freed.rowCount) await pushTagChange(); // not billed in timesheet.io any more
 		// ...and so are hours billed here. Their journal entry is not reversed (nothing is posted for a
 		// tag); it stays on the time entry (billing_journal_entry_id) and is reversed if the hours are
 		// billed here again, or the hours are billed once more when someone puts the tag back.
@@ -1471,6 +1483,12 @@ export default async function register(ctx) {
 		);
 		await ctx.ledger.unlinkJournalEntry(entryId, BILLED_TAG.ref).catch(() => false); // the older mark says the same
 		for (const id of new Set(rows.map((r) => String(r.billing_id)))) await retotal(id, 'tag "billed" removed');
+		await pushTagChange();
+	}
+	/** A tag changed the billed or paid state of some hours: send it to timesheet.io now, not at the next sync. */
+	async function pushTagChange() {
+		const org = await ctx.orgs.current().catch(() => null);
+		pushSoonIn(org?.id ?? 1);
 	}
 	if (ctx.tags)
 		ctx.tags.onChange(async (c) => {
@@ -1506,15 +1524,19 @@ export default async function register(ctx) {
 				await serial(org.id, () => postClearing());
 				if (ctx.tags) {
 					// Tags set or taken off while the module wasn't running.
+					let changed = false;
 					const { rows: live } = await q(`SELECT id, clearing_entry_id, billed_tag_entry_id, billing_paid FROM ${S}.time_entries WHERE clearing_status = 'posted' AND clearing_entry_id IS NOT NULL AND billing_id IS NULL ORDER BY id LIMIT 5000`);
 					for (const t of live) {
 						const tags = await ctx.tags.of(t.clearing_entry_id).catch(() => null);
 						if (!tags) continue;
 						const billed = tags.some((x) => x.tag === "billed" && x.module_id !== ctx.id);
 						const paid = tags.some((x) => x.tag === "paid");
-						if (billed !== (t.billed_tag_entry_id !== null) || paid !== t.billing_paid)
-							await q(`UPDATE ${S}.time_entries SET billed_tag_entry_id = $2, billing_paid = $3, push_status = 'pending' WHERE id = $1`, [t.id, billed ? t.clearing_entry_id : null, paid]);
+						if (billed !== (t.billed_tag_entry_id !== null) || paid !== t.billing_paid) {
+							await q(`UPDATE ${S}.time_entries SET billed_tag_entry_id = $2, billing_paid = $3, push_status = 'pending', push_error = '', updated_at = now() WHERE id = $1`, [t.id, billed ? t.clearing_entry_id : null, paid]);
+							changed = true;
+						}
 					}
+					if (changed) pushSoonIn(org.id); // timesheet.io hears of it now
 				}
 				if (!ctx.tags) return;
 				const { rows: untagged } = await q(

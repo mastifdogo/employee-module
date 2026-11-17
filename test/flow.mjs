@@ -193,6 +193,7 @@ step("billable hours go to the clearing account by themselves, tagged customer, 
 const t1c = (await entryBy((t) => t.id === t1.id)).clearing_entry_id;
 await tagAs(t1c, "billed");
 await until("tagged hours are billed", async () => String((await entryBy((t) => t.id === t1.id)).billed_tag_entry_id) === String(t1c));
+await until("billed reaches timesheet.io by itself (no sync)", async () => (await mt("t1")).billed === true);
 await ok(m("PATCH", `/time/${t1.id}`, { minutes: 200 }), 409); // billed: locked
 await ok(m("DELETE", `/time/${t1.id}`), 409);
 assert.ok((await ok(m("GET", "/time?show=billed"))).data.some((t) => t.id === t1.id));
@@ -200,11 +201,13 @@ assert.equal((await ok(m("GET", "/time?show=in_clearing"))).data.some((t) => t.i
 assert.equal((await ok(m("GET", `/calendar?from=${day(3)}&to=${day(3)}&show=billed`))).data.length, 1);
 await tagAs(t1c, "paid");
 await until("paid shows on the hours", async () => (await entryBy((t) => t.id === t1.id)).billing_paid === true);
+await until("paid reaches timesheet.io by itself", async () => (await mt("t1")).paid === true);
 await untagAs(t1c, "paid");
 await until("and goes again", async () => (await entryBy((t) => t.id === t1.id)).billing_paid === false);
+await until("in timesheet.io too", async () => (await mt("t1")).paid === false);
 await settle();
 assert.equal((await mt("t1")).billed, true);
-step("tagged billed (an invoice bills them): hours billed and locked, billed in timesheet.io; paid follows its tag");
+step("tagged billed (an invoice bills them): hours billed and locked; billed and paid tags reach timesheet.io straight away");
 
 // Ledger wins: a change not yet sent (timesheet.io refuses the key meanwhile) and billed time keep Ledger's version
 const b9 = await entryBy((t) => t.description === "Task bulk9");
@@ -232,6 +235,7 @@ step("changed in both places: Ledger wins; changed only in timesheet.io: taken")
 // The invoice is voided: "billed" comes off, the hours are open again (nothing is posted for a tag)
 await untagAs(t1c, "billed");
 await until("untagged hours are open again", async () => (await entryBy((t) => t.id === t1.id)).billed_tag_entry_id === null);
+await until("not billed in timesheet.io any more, by itself", async () => (await mt("t1")).billed === false);
 assert.equal((await journal(t1c)).reversed_by_id, null);
 assert.equal(String((await entryBy((t) => t.id === t1.id)).clearing_entry_id), String(t1c));
 await settle();
