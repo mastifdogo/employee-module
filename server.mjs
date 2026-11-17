@@ -399,7 +399,15 @@ export default async function register(ctx) {
 	async function unclear(entryId, description, user) {
 		if (entryId === null || entryId === undefined) return;
 		await reverseEntryOf(entryId, description, user);
-		if (ctx.tags) for (const t of ["customer", "employee", "project"]) await ctx.tags.remove(entryId, t).catch(() => {});
+		// The tags this module put on it (customer, employee, project, the employee's name); others' stay.
+		if (ctx.tags) for (const t of await ctx.tags.of(entryId).catch(() => [])) if (t.module_id === ctx.id) await ctx.tags.remove(entryId, t.tag).catch(() => {});
+	}
+	/** The employee's name as a tag: Ledger's tags are lowercase words ("Ana Silva" → "ana-silva"). */
+	const RESERVED_TAGS = new Set(["paid", "billed", "overdue", "customer", "vendor", "employee", "project"]);
+	function nameTag(name) {
+		let t = String(name).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+		if (!/^[a-z]/.test(t) || RESERVED_TAGS.has(t)) t = `employee-${t}`.replace(/-+$/, "");
+		return t.slice(0, 40).replace(/-+$/, "");
 	}
 
 	/** Posts, replaces or reverses the clearing transactions of time entries marked pending (up to 500 at a time). */
@@ -481,6 +489,7 @@ export default async function register(ctx) {
 				// Who it is with, who did it, and for what.
 				await tagSafely(entry.id, "customer", { entity_id: Number(customer.id) }, user);
 				await tagSafely(entry.id, "employee", { note: t.employee_name.slice(0, 200) }, user);
+				await tagSafely(entry.id, nameTag(t.employee_name), { note: t.employee_name.slice(0, 200) }, user);
 				if (t.project_name) await tagSafely(entry.id, "project", { note: t.project_name.slice(0, 200) }, user);
 			} catch (e) {
 				await done("failed", String(e?.message ?? e)).catch(() => {});

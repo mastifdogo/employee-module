@@ -18,7 +18,9 @@ newer). Install it under **Settings → Modules** by entering this repository's
 - **Billable hours go to the books by themselves** (no Billable hours tab
   since 0.12.0): every billable time entry with a customer (its project's) and
   a billing rate is one transaction in the module's *Billable hours* clearing
-  account, tagged with the **customer**, **employee** and **project**. Change
+  account, tagged with the **customer**, **employee** and **project**, and
+  with **the employee's name** as a tag of its own (`ana-silva` for Ana
+  Silva: Ledger's tags are lowercase words). Change
   the hours and that transaction is reversed and a new one posted; make them
   not billable and it is reversed. Nothing is revenue until the hours are
   invoiced: Sales offers each one as a billable item, and the **billed** tag it
@@ -108,7 +110,10 @@ The module uses the tags on journal entries that Ledger shares between itself
 and every module (Ledger ≥ 0.23.0).
 
 - **What it sets.** On each billable hours transaction: `customer` (the
-  project's customer), `employee` and `project` (the names, as notes). On each
+  project's customer), `employee` and `project` (the names, as notes), and
+  the employee's name as a tag (lowercase, words joined by `-`, e.g.
+  `ana-silva`; prefixed `employee-` when it would clash with a standard tag
+  or doesn't start with a letter). On each
   of a pay run's cost entries: `project` and its `customer`. When a
   transaction is replaced, its tags come off the old one.
 - **What it follows.** A tag belongs to the transaction, so Sales, another

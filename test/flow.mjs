@@ -145,8 +145,9 @@ assert.deepEqual([billAcct.name, billAcct.type, billAcct.kind, billAcct.currency
 assert.equal(Number((await ok(call("GET", "/api/v1/accounts/4100"))).balance_cents), 0); // nothing is revenue yet
 assert.equal((await ok(m("GET", "/accounts"))).data.some((x) => x.code === BILLABLE), false); // hidden clearing account: not in pickers
 assert.equal((await ok(m("GET", "/summary"))).billable_hours.code, BILLABLE);
-assert.deepEqual(await tagsOf(entry.id), [["customer", "employees", "Acme Corp"], ["employee", "employees", null], ["project", "employees", null]]);
-assert.deepEqual(entry.tags.filter((t) => t.tag !== "customer").map((t) => [t.tag, t.note]).sort(), [["employee", "Ana S."], ["project", "Website rebuild"]]);
+assert.deepEqual(await tagsOf(entry.id), [["ana-s", "employees", null], ["customer", "employees", "Acme Corp"], ["employee", "employees", null], ["project", "employees", null]]); // "Ana S." as a tag of its own
+assert.ok((await tagsOf((await entryBy((t) => t.description === "Task t4")).clearing_entry_id)).some(([tag]) => tag === "ben-okafor"));
+assert.deepEqual(entry.tags.filter((t) => t.tag !== "customer").map((t) => [t.tag, t.note]).sort(), [["ana-s", "Ana S."], ["employee", "Ana S."], ["project", "Website rebuild"]]);
 assert.deepEqual(await sortCents(acme.id), [24000, 36000, 84000]); // t4, t1, t2: one item per time entry, for Sales to invoice
 assert.deepEqual(await salesItems(cust.id), [{ memo: `${day(4)} · Ana S. · 2.00 h × 150.00 · Audit: Review`, cents: 30000 }]);
 // Changed: the old transaction is reversed (its tags come off) and a new one posted
