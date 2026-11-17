@@ -59,8 +59,9 @@
 	.cal-head { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; justify-content: space-between; margin-bottom: 0.5rem; }
 	.cal-head h2 { margin: 0; font-size: 1.2rem; }
 	.cal-head label { flex: 0 1 12rem; }
-	.cal-head .row { flex-wrap: nowrap; margin: 0; }
-	.cal-head .row button { flex: 0 0 auto; }
+	.cal-filters { margin: 0 0 0.6rem; }
+	.cal-filters label { flex: 1 1 9rem; }
+	.cal-filters button { flex: 0 0 auto; }
 	.cal-wrap { --rowh: 5.6rem; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
 	.dow, .week { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
 	.dow { border-bottom: 1px solid var(--border); background: var(--soft); font-size: 0.72rem; text-transform: uppercase; color: var(--muted); }
@@ -358,9 +359,14 @@
 			if (sync[2]) c.title = sync[2];
 			out.push(c);
 		} else if (t.in_timesheet) out.push(chip("timesheet.io"));
+		const titled = (c, title) => ((c.title = title), c);
 		if (t.billing_id !== null) out.push(chip("billed", "ok"));
 		else if (t.billed_tag_entry_id !== null && t.billed_tag_entry_id !== undefined) out.push(taggedChip(t, "billed"));
-		else if (t.billable) out.push(chip("billable", "warn"));
+		else if (t.billable && t.clearing_status === "posted") out.push(titled(chip("to invoice", "ok"), "In the Billable hours clearing account, tagged with the customer, employee and project: Sales offers it on the customer's next invoice."));
+		else if (t.billable && t.clearing_status === "failed") out.push(titled(chip("not in clearing", "bad"), `Couldn't be posted to the Billable hours clearing account: ${t.clearing_error}. Tried again with the next change.`));
+		else if (t.billable && t.clearing_status === "pending") out.push(titled(chip("to clearing", "warn"), "Going to the Billable hours clearing account."));
+		else if (t.billable) out.push(titled(chip("billable", "warn"), t.clearing_error ? `Not in the Billable hours clearing account: ${t.clearing_error}.` : "Billable"));
+		if (t.billing_paid) out.push(titled(chip("paid", "ok"), "Its transaction is tagged Paid: the customer has paid for these hours."));
 		if (t.pay_run_id !== null) out.push(chip("on pay run", "ok"));
 		return out;
 	}
@@ -371,7 +377,7 @@
 		const reload = () => Promise.all([showTime(), refreshSummary()]);
 		const sel = h("select", { onchange: (e) => ((timeFilter.employee_id = e.target.value), showTime().catch(fail)) }, h("option", { value: "" }, "Everyone"), st.employees.map((e) => h("option", { value: e.id }, e.name)));
 		sel.value = timeFilter.employee_id;
-		const show = h("select", { onchange: (e) => ((timeFilter.show = e.target.value), showTime().catch(fail)) }, h("option", { value: "" }, "All time"), h("option", { value: "billable" }, "Billable, not billed"), h("option", { value: "unpaid" }, "Not on a pay run"));
+		const show = h("select", { onchange: (e) => ((timeFilter.show = e.target.value), showTime().catch(fail)) }, h("option", { value: "" }, "All time"), h("option", { value: "billable" }, "Billable, not billed"), h("option", { value: "in_clearing" }, "To invoice (in clearing)"), h("option", { value: "billed" }, "Billed"), h("option", { value: "unpaid" }, "Not on a pay run"));
 		show.value = timeFilter.show;
 		const total = data.reduce((a, t) => a + t.minutes, 0);
 		put($("main"), 
@@ -403,7 +409,8 @@
 				: table(
 						["Date", "Employee", "Project", "What", "#Hours", "#Rate", "#Amount", "", ""],
 						data.map((t) => {
-							const locked = t.billing_id !== null || t.pay_run_id !== null;
+							// Billed (on an older billing, or its transaction tagged Billed by an invoice) or paid: not changed here.
+							const locked = t.billing_id !== null || t.pay_run_id !== null || (t.billed_tag_entry_id !== null && t.billed_tag_entry_id !== undefined);
 							return h(
 								"tr",
 								{},
@@ -457,10 +464,7 @@
 		);
 	}
 
-	// ---- Billable hours ---------------------------------------------------------
-	const billPeriod = { from: "", to: today() };
-	const toBill = new Set(); // ids of unbilled time entries chosen for "Bill chosen"
-	const toUnbill = new Set(); // ids of billed time entries chosen for "Unbill chosen"
+	// ---- Billed hours (billings from before 0.12.0, and the shared tags) -------------
 
 	function downloadCsv(name, rows) {
 		const esc = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
@@ -470,9 +474,9 @@
 	}
 
 	/** Hours not billed here whose transaction someone tagged Billed in Ledger (shared tags). */
-	const taggedChip = (t, text = "Billed by tag") => {
+	const taggedChip = (t, text = "billed") => {
 		const c = chip(text, "ok");
-		c.title = `Transaction ${t.billed_tag_entry_id} was tagged Billed outside Employees (by another module or a person). Take the tag off there to bill these hours here.`;
+		c.title = `Transaction ${t.billed_tag_entry_id} is tagged Billed (an invoice bills it, or a person tagged it): these hours are billed and locked. Taking the tag off, or voiding the invoice, frees them.`;
 		return c;
 	};
 	/** What the shared tag Paid on a billing's transactions says ("paid", "partly paid"); set by Sales or a person. */
@@ -545,195 +549,6 @@
 		};
 		box.sync = sync;
 		return box;
-	}
-
-	async function showBilling() {
-		const range = { ...(billPeriod.from ? { from: billPeriod.from } : {}), ...(billPeriod.to ? { to: billPeriod.to } : {}) };
-		const [{ data: open }, { data: billed }, { data: done }] = await Promise.all([
-			api(`/time?${new URLSearchParams({ show: "billable", ...range })}`),
-			api(`/time?${new URLSearchParams({ show: "billed", ...range })}`),
-			api("/billings"),
-		]);
-		const openIds = new Set(open.map((t) => t.id));
-		for (const id of [...toBill]) if (!openIds.has(id)) toBill.delete(id);
-		const billedIds = new Set(billed.map((t) => t.id));
-		for (const id of [...toUnbill]) if (!billedIds.has(id)) toUnbill.delete(id);
-		const reload = () => Promise.all([showBilling(), refreshSummary()]);
-		const edit = canEdit();
-		const boxes = [];
-
-		// The action bars, redrawn as boxes are ticked.
-		const billBar = h("div", { class: "batchbar" });
-		const unbillBar = h("div", { class: "batchbar" });
-		function redraw() {
-			for (const b of boxes) b.sync?.();
-			const chosen = open.filter((t) => toBill.has(t.id));
-			put(
-				billBar,
-				h("span", {}, chosen.length ? `${chosen.length} chosen · ${hrs(chosen.reduce((a, t) => a + t.minutes, 0))} h · ${moneyC(chosen.reduce((a, t) => a + Number(t.amount_cents), 0))}` : "Choose time entries to bill."),
-				h("button", { disabled: chosen.length === 0, onclick: () => billDialog(chosen) }, "Bill chosen…"),
-				chosen.length > 0 && h("button", { class: "plain", onclick: () => (toBill.clear(), redraw()) }, "Clear"),
-			);
-			const unchosen = billed.filter((t) => toUnbill.has(t.id));
-			put(
-				unbillBar,
-				h("span", {}, unchosen.length ? `${unchosen.length} chosen · ${moneyC(unchosen.reduce((a, t) => a + Number(t.amount_cents), 0))}` : "Choose billed time entries to unbill."),
-				h(
-					"button",
-					{
-						class: "danger",
-						disabled: unchosen.length === 0,
-						onclick: act(async () => {
-							if (!confirm(`Unbill ${unchosen.length} time ${unchosen.length === 1 ? "entry" : "entries"}? ${unchosen.length === 1 ? "Its transaction is" : "Their transactions are"} reversed and the hours become billable again.`)) return;
-							const r = await send("POST", "/billed/unbill", { entry_ids: unchosen.map((t) => t.id) });
-							toUnbill.clear();
-							await reload();
-							say(`Unbilled ${r.unbilled} time ${r.unbilled === 1 ? "entry" : "entries"}.${r.skipped.length ? ` ${r.skipped.length} left as they were: ${[...new Set(r.skipped.map((x) => x.reason))].join("; ")}.` : ""}`);
-						}),
-					},
-					"Unbill chosen",
-				),
-				unchosen.length > 0 && h("button", { class: "plain", onclick: () => (toUnbill.clear(), redraw()) }, "Clear"),
-			);
-		}
-
-		function billableNote() {
-			const acct = st.summary.billable_hours;
-			const where = acct ? `the clearing account ${acct.code} · ${acct.name}` : "a Billable hours clearing account this module makes the first time";
-			return `Each time entry is recorded in ${where}, with the customer on it. Nothing is posted to revenue: that happens when the hours are invoiced. Sales offers each one as a billable item on the customer's next invoice once that account is added under Settings → Sales → Accounts → Billable costs.`;
-		}
-
-		function billDialog(chosen) {
-			const date = h("input", { type: "date", required: true, value: today() });
-			const customers = new Set(chosen.map((t) => t.customer_entity_id)).size;
-			dialog(
-				`Bill ${chosen.length} time ${chosen.length === 1 ? "entry" : "entries"}`,
-				h(
-					"div",
-					{},
-					h("p", {}, `${hrs(chosen.reduce((a, t) => a + t.minutes, 0))} h for ${customers} ${customers === 1 ? "customer" : "customers"}: ${moneyC(chosen.reduce((a, t) => a + Number(t.amount_cents), 0))}.`),
-					h(
-						"p",
-						{ class: "muted" },
-						billableNote(),
-					),
-					h("div", { class: "row" }, field("Billing date", date)),
-				),
-				"Bill",
-				async () => {
-					const r = await send("POST", "/billings/batch", { entry_ids: chosen.map((t) => t.id), billing_date: date.value });
-					toBill.clear();
-					await loadShared(); // the account may have just been made
-					await reload();
-					say(`Billed ${r.billed} time ${r.billed === 1 ? "entry" : "entries"}, ${moneyC(r.total_cents)}.${r.skipped.length ? ` ${r.skipped.length} not billed: ${[...new Set(r.skipped.map((x) => x.reason))].join("; ")}.` : ""}`);
-				},
-			);
-		}
-
-		// Unbilled, by customer
-		const groups = new Map();
-		for (const t of open) {
-			const key = t.customer_entity_id === null ? "" : String(t.customer_entity_id);
-			if (!groups.has(key)) groups.set(key, []);
-			groups.get(key).push(t);
-		}
-		const name = (id) => st.customers.find((c) => String(c.id) === id)?.name ?? st.projects.find((p) => String(p.customer_entity_id) === id)?.customer_name ?? "A customer no longer in Entities";
-		const cards = [...groups]
-			.sort(([a], [b]) => (a === "" ? 1 : b === "" ? -1 : name(a).localeCompare(name(b))))
-			.map(([key, list]) => {
-				const ids = list.filter((t) => !cantBill(t)).map((t) => t.id);
-				const all = edit && allBox(toBill, ids, redraw, `Choose all of ${key === "" ? "these" : name(key)}`);
-				if (all) boxes.push(all);
-				return h(
-					"div",
-					{ class: "card" },
-					h("h3", {}, h("span", { class: "pickhead" }, all, key === "" ? "No customer yet" : name(key)), h("small", {}, `${hrs(list.reduce((a, t) => a + t.minutes, 0))} h · ${moneyC(list.reduce((a, t) => a + Number(t.amount_cents), 0))}`)),
-					key === "" && h("p", { class: "muted" }, "These hours can't be billed until their project has a customer (People tab → Projects), or the entry has a project."),
-					table(
-						[edit ? " " : "", "Date", "Employee", "Project", "What", "#Hours", "#Rate", "#Amount"],
-						list.map((t) =>
-							h(
-								"tr",
-								{},
-								h("td", { class: "pick" }, edit && pickBox(toBill, t.id, redraw, cantBill(t))),
-								h("td", { style: "white-space: nowrap" }, t.work_date),
-								h("td", {}, t.employee_name),
-								h("td", {}, t.project_name ?? h("span", { class: "muted" }, "—")),
-								h("td", {}, t.description),
-								h("td", { class: "n" }, hrs(t.minutes)),
-								h("td", { class: "n" }, Number(t.rate_cents) > 0 ? money(t.rate_cents) : chip("no rate", "warn")),
-								h("td", { class: "n" }, money(t.amount_cents)),
-							),
-						),
-					),
-				);
-			});
-
-		// Billed time entries
-		const unbillable = (t) => (t.billing_id === null ? `Not billed here: transaction ${t.billed_tag_entry_id} is tagged Billed in Ledger. Take the tag off there to bill these hours here.` : t.billing_journal_entry_id === null ? "Billed before each time entry had its own transaction: reverse its whole billing below." : null);
-		const billedAll = edit && allBox(toUnbill, billed.filter((t) => !unbillable(t)).map((t) => t.id), redraw, "Choose all billed");
-		if (billedAll) boxes.push(billedAll);
-		const billedTable = billed.length
-			? table(
-					[edit ? " " : "", "Date", "Employee", "Customer", "What", "#Hours", "#Amount", "Billed", ""],
-					billed.map((t) =>
-						h(
-							"tr",
-							{},
-							h("td", { class: "pick" }, edit && pickBox(toUnbill, t.id, redraw, unbillable(t))),
-							h("td", { style: "white-space: nowrap" }, t.work_date),
-							h("td", {}, t.employee_name),
-							h("td", {}, t.customer_entity_id === null ? "" : name(String(t.customer_entity_id))),
-							h("td", {}, t.description),
-							h("td", { class: "n" }, hrs(t.minutes)),
-							h("td", { class: "n" }, money(t.amount_cents)),
-							h("td", { style: "white-space: nowrap" }, t.billing_id === null ? taggedChip(t) : chip("Billed", "ok"), t.billing_paid ? " " : "", t.billing_paid && paidChip("paid")),
-							h("td", { style: "white-space: nowrap" }, journalLink(t.billing_id === null ? t.billed_tag_entry_id : t.billing_journal_entry_id)),
-						),
-					),
-				)
-			: empty("No billed time in this period.");
-
-		put(
-			$("main"),
-			h("div", { class: "row" }, field("Time from", h("input", { type: "date", value: billPeriod.from, onchange: (e) => ((billPeriod.from = e.target.value), showBilling().catch(fail)) })), field("To", h("input", { type: "date", value: billPeriod.to, onchange: (e) => ((billPeriod.to = e.target.value), showBilling().catch(fail)) }))),
-			h("h2", {}, "To bill"),
-			edit && open.length > 0 && billBar,
-			cards.length ? cards : empty("No unbilled billable hours in this period. Mark time as billable on the Time tab (or in timesheet.io)."),
-			h("h2", { class: "pickhead" }, billedAll, "Billed time"),
-			edit && billed.length > 0 && unbillBar,
-			billedTable,
-			h("h2", {}, "Billings"),
-			h("p", { class: "muted" }, "Each billing is one customer's time from one batch."),
-			done.length === 0
-				? empty("Nothing billed yet.")
-				: table(
-						["#No.", "Customer", "Period", "Billed", "#Hours", "#Amount", "", ""],
-						done.map((b) =>
-							h(
-								"tr",
-								{},
-								h("td", { class: "n" }, String(b.id)),
-								h("td", {}, b.customer_name),
-								h("td", {}, `${b.period_start} – ${b.period_end}`),
-								h("td", { style: "white-space: nowrap" }, b.billing_date),
-								h("td", { class: "n" }, hrs(b.total_minutes)),
-								h("td", { class: "n" }, `${money(b.total_cents)} ${b.currency}`),
-								h("td", { style: "white-space: nowrap" }, chip(b.status, b.status === "posted" ? "ok" : b.status === "reversed" ? "bad" : "warn"), b.paid ? " " : "", b.paid && paidChip(b.paid)),
-								h(
-									"td",
-									{ style: "white-space: nowrap" },
-									h("button", { class: "plain small", onclick: act(() => openBilling(b.id)) }, "Open"),
-									" ",
-									edit && b.status === "posted" && h("button", { class: "danger small", onclick: act(async () => confirm(`Reverse billing ${b.id} for ${b.customer_name}? Its transactions are reversed and the hours become billable again.`) && (await send("POST", `/billings/${b.id}/reverse`), await reload())) }, "Reverse"),
-									isRoot() && " ",
-									isRoot() && rootButton("Delete", act(async () => confirm(`Root: delete billing ${b.id} for ${b.customer_name}? Its hours become billable again; its transactions stay in the books. The root log can put it back.`) && (await api(`/billings/${b.id}`, { method: "DELETE" }), await reload()))),
-								),
-							),
-						),
-					),
-		);
-		redraw();
 	}
 
 	// ---- Payroll ----------------------------------------------------------------
@@ -823,6 +638,29 @@
 				run.lines.map((l) => h("tr", {}, h("td", {}, l.employee_name, " ", l.pay_type === "salary" && chip("salary")), h("td", { class: "n" }, l.pay_type === "salary" ? "" : hrs(l.minutes)), h("td", { class: "n" }, money(l.rate_cents)), h("td", { class: "n" }, amount(l, "gross_cents")), h("td", { class: "n" }, amount(l, "deductions_cents")), h("td", { class: "n" }, money(l.net_cents)), h("td", { class: "n" }, amount(l, "employer_cost_cents")))),
 				h("tr", {}, h("td", { colspan: 3 }, "Total"), h("td", { class: "n" }, money(run.gross_cents)), h("td", { class: "n" }, money(run.deductions_cents)), h("td", { class: "n" }, money(run.net_cents)), h("td", { class: "n" }, money(run.employer_cost_cents))),
 			),
+			run.costs?.length > 0 && h("h2", {}, "Cost by project"),
+			run.costs?.length > 0 &&
+				h(
+					"p",
+					{ class: "muted" },
+					run.status === "draft"
+						? "When posted, each project's share is its own entry, tagged with the project and its customer: hourly pay split by the hours on this run, salaries and hours without a project together."
+						: "Each project's share is its own entry, tagged with the project and its customer.",
+				),
+			run.costs?.length > 0 &&
+				table(
+					["Project", "Customer", "#Gross", "#Employer cost"],
+					run.costs.map((c) =>
+						h(
+							"tr",
+							{},
+							h("td", {}, c.project_name ?? h("span", { class: "muted" }, "No project")),
+							h("td", {}, c.customer_entity_id === null ? "" : (st.customers.find((x) => String(x.id) === String(c.customer_entity_id))?.name ?? "")),
+							h("td", { class: "n" }, money(c.gross_cents)),
+							h("td", { class: "n" }, money(c.employer_cost_cents)),
+						),
+					),
+				),
 			h(
 				"div",
 				{ class: "actions" },
@@ -968,13 +806,15 @@
 	}
 
 	// ---- Calendar: one month in view; scroll up or down for other months ---------------
-	const cal = { employee_id: "", days: new Map(), start: null, end: null, busy: false };
+	const cal = { employee_id: "", customer_id: "", project_id: "", show: "", days: new Map(), start: null, end: null, busy: false };
 	const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
 	const monthName = new Intl.DateTimeFormat(undefined, { month: "long", year: "numeric" });
 	const shortMonth = new Intl.DateTimeFormat(undefined, { month: "short" });
 
 	async function calLoad(from, to) {
-		const { data } = await api(`/calendar?from=${iso(from)}&to=${iso(to)}${cal.employee_id ? `&employee_id=${cal.employee_id}` : ""}`);
+		const qs = new URLSearchParams({ from: iso(from), to: iso(to) });
+		for (const k of ["employee_id", "customer_id", "project_id", "show"]) if (cal[k]) qs.set(k, cal[k]);
+		const { data } = await api(`/calendar?${qs}`);
 		for (const r of data) {
 			if (!cal.days.has(r.work_date)) cal.days.set(r.work_date, []);
 			cal.days.get(r.work_date).push(r);
@@ -1028,8 +868,25 @@
 		await calLoad(cal.start, cal.end);
 
 		const title = h("h2", { "aria-live": "polite" });
-		const who = h("select", { onchange: (e) => ((cal.employee_id = e.target.value), showCalendar(shownMonth()).catch(fail)) }, h("option", { value: "" }, "Everyone"), st.employees.map((e) => h("option", { value: e.id }, e.name)));
-		who.value = cal.employee_id;
+		// Filters: the calendar shows only the hours that match them.
+		const filter = (key, ...options) => {
+			const sel = h("select", { onchange: (e) => ((cal[key] = e.target.value), showCalendar(shownMonth()).catch(fail)) }, ...options);
+			sel.value = cal[key];
+			return sel;
+		};
+		const who = filter("employee_id", h("option", { value: "" }, "Everyone"), st.employees.map((e) => h("option", { value: e.id }, e.name)));
+		const whose = filter("customer_id", h("option", { value: "" }, "All customers"), st.customers.map((c) => h("option", { value: c.id }, c.name)));
+		const what = filter("project_id", h("option", { value: "" }, "All projects"), st.projects.map((p) => h("option", { value: p.id }, p.name)), h("option", { value: "none" }, "No project"));
+		const which = filter(
+			"show",
+			h("option", { value: "" }, "All hours"),
+			h("option", { value: "billable" }, "Billable"),
+			h("option", { value: "not_billable" }, "Not billable"),
+			h("option", { value: "unbilled" }, "Billable, not billed"),
+			h("option", { value: "billed" }, "Billed"),
+			h("option", { value: "unpaid" }, "Not on a pay run"),
+		);
+		const filtered = ["employee_id", "customer_id", "project_id", "show"].some((k) => cal[k]);
 		const box = h("div", { class: "cal", tabindex: "0", "aria-label": "Calendar. Scroll up or down to change the month." }, calWeeks(cal.start, cal.end));
 		let month = "";
 		const shownMonth = () => new Date(Number(month.slice(0, 4)), Number(month.slice(5)) - 1, 1);
@@ -1094,7 +951,16 @@
 		const dow = new Intl.DateTimeFormat(undefined, { weekday: "short" });
 		put(
 			$("main"),
-			h("div", { class: "cal-head" }, title, h("div", { class: "row" }, field("Employee", who), h("button", { class: "plain", onclick: () => goTo(new Date()) }, "Today"))),
+			h("div", { class: "cal-head" }, title, h("button", { class: "plain", onclick: () => goTo(new Date()) }, "Today")),
+			h(
+				"div",
+				{ class: "row cal-filters" },
+				field("Employee", who),
+				field("Customer", whose),
+				field("Project", what),
+				field("Hours", which),
+				filtered && h("button", { class: "plain", onclick: () => (Object.assign(cal, { employee_id: "", customer_id: "", project_id: "", show: "" }), showCalendar(shownMonth()).catch(fail)) }, "Clear"),
+			),
 			h("div", { class: "cal-wrap" }, h("div", { class: "dow" }, [0, 1, 2, 3, 4, 5, 6].map((i) => h("span", {}, dow.format(addDays(base, i))))), box),
 			h("p", { class: "muted" }, "Hours worked each day. Scroll up or down in the calendar to move through the months; click a day to see its time entries."),
 		);
@@ -1105,7 +971,6 @@
 	const TABS = [
 		["time", "Time", showTime],
 		["calendar", "Calendar", () => showCalendar()],
-		["billing", "Billable hours", showBilling],
 		["payroll", "Payroll", showPayroll],
 		["people", "People", showPeople],
 	];
@@ -1122,7 +987,8 @@
 			openRun = Number(p.get("payrun"));
 			await show("payroll");
 		} else if (p.get("billing") && /^\d+$/.test(p.get("billing"))) {
-			await show("billing");
+			// A billing from before 0.12.0 (journal entries link here)
+			await show("time");
 			await openBilling(p.get("billing"));
 		} else if (p.get("employee")) {
 			await show("people");

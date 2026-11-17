@@ -3,40 +3,43 @@
 Track employee time, bill customers for billable hours and run payroll, with
 time pulled from [timesheet.io](https://timesheet.io) through its API.
 
-A module for [Ledger](https://github.com/mastifdogo/Bookeeping) (0.21.1 or
-newer; Ledger's shared tags, see *Tags* below, need 0.23.0). Install it under **Settings → Modules** by entering this repository's
+A module for [Ledger](https://github.com/mastifdogo/Bookeeping) (0.23.0 or
+newer). Install it under **Settings → Modules** by entering this repository's
 `owner/name`.
 
 ## What it does
 
 - **Time**: time entries per employee, day and project, added by hand or
   pulled from timesheet.io. Each can be billable.
-- **Calendar**: a month of hours worked per day, for everyone or one
-  employee. Scroll up or down in it to move through the months; click a day
-  to open its time entries.
-- **Billable hours**: unbilled billable hours grouped by customer. Tick time
-  entries (one by one, a whole customer, or across customers) and press
-  *Bill chosen*. **Each time entry posts its own transaction in the
-  module's *Billable hours* clearing account**, with the customer on it and
-  tagged **billed** and with the **customer** (Ledger's shared tags). Nothing is posted to revenue: that happens when the hours
-  are invoiced. Sales picks them up as billable items (see *Invoicing billed
-  hours* below). Billed time can be ticked
-  and unbilled the same way, which reverses those transactions and makes the
-  hours billable again. A batch makes one billing per customer; a billing can
-  be opened (with a CSV of its lines for the invoice) or reversed as a whole.
+- **Calendar**: a month of hours worked per day. Filter it by employee,
+  customer, project and kind of hours (billable, not billable, billable but
+  not billed, billed, not on a pay run). Scroll up or down in it to move
+  through the months; click a day to open its time entries.
+- **Billable hours go to the books by themselves** (no Billable hours tab
+  since 0.12.0): every billable time entry with a customer (its project's) and
+  a billing rate is one transaction in the module's *Billable hours* clearing
+  account, tagged with the **customer**, **employee** and **project**. Change
+  the hours and that transaction is reversed and a new one posted; make them
+  not billable and it is reversed. Nothing is revenue until the hours are
+  invoiced: Sales offers each one as a billable item, and the **billed** tag it
+  puts on the transaction marks the hours billed here (and locks them); a
+  **paid** tag marks them paid. See *Invoicing billed hours* below.
 - **Payroll**: a pay run takes every hour in a period that isn't on a pay run
   yet (hourly employees) plus one period's pay for each salaried employee.
   You review the draft, correct gross pay, deductions and employer cost per
-  person, then post it as one journal entry:
+  person, then post it. **Its cost is split by project**: one entry per
+  project, tagged with the **project** and its **customer** (hourly pay split
+  by the hours on the run; salaries and hours without a project together),
+  booked through the *Wages payable* clearing account, which the pay run's own
+  entry then clears:
 
-  | | Debit | Credit |
+  | Entry | Debit | Credit |
   |---|---|---|
-  | Wages expense | gross pay | |
-  | Employer payroll cost | employer's share | |
-  | Payroll liabilities | | deductions + employer's share |
-  | The account pay comes from | | net pay |
+  | One per project | Wages expense (gross pay), Employer payroll cost (employer's share) | Wages payable (clearing) |
+  | The pay run's | Wages payable (clearing) | Payroll liabilities (deductions + employer's share), the account pay comes from (net pay) |
 
-  A posted pay run can be reversed; its hours go back to unpaid.
+  The pay run's page shows the cost by project before you post. A posted pay
+  run can be reversed: all its entries are, and its hours go back to unpaid.
 - **People**: employees (hourly or salary, pay rate, billing rate, the
   percentages a pay run starts from) and projects (the customer they are
   billed to and an hourly rate). Customers are Ledger's shared **Entities**.
@@ -51,7 +54,7 @@ every pay run. Use your payroll provider's or tax authority's figures.
 
 In Ledger's root mode (Ledger ≥ 0.21.1, admins only) the page shows red
 **Root** buttons that reach records the module normally protects: edit or
-delete a billed or paid time entry, delete any billing or pay run (its hours
+delete a billed or paid time entry, delete any pay run or older billing (its hours
 become billable or unpaid again), and change the amounts of a posted pay
 run. Ledger keeps everything these change and can put it back from Settings →
 Root log. They change only the module's records: journal entries stay in the
@@ -61,79 +64,63 @@ reversed billing or pay run.
 
 ## Invoicing billed hours
 
-The first time hours are billed, Ledger makes the module's **clearing
-account** *Billable hours* (Ledger ≥ 0.20.0; code `CLR-EMPLOYEES-BILLABLE`
-unless someone renumbers it). Every billed time entry is one journal entry in
-that account, with the customer as the entry's entity: a **debit** (the
-billable item) and an **equal credit**. So the account stays at zero (the
-Accounts page never flags it) and **nothing is revenue until the hours are
-invoiced**. In the **Sales** module:
+Ledger makes the module's **clearing account** *Billable hours* the first
+time billable hours come in (code `CLR-EMPLOYEES-BILLABLE` unless someone
+renumbers it). Every billable time entry is one journal entry in it, with the
+customer as the entry's entity: a **debit** (the billable item) and an
+**equal credit**, so the account stays at zero and **nothing is revenue until
+the hours are invoiced**. In the **Sales** module:
 
 1. Under **Settings → Sales → Accounts → Billable costs**, add the
    *Billable hours* clearing account.
-2. On a customer's new invoice, **+ Billable items** lists their billed hours,
-   one per time entry (date, person, hours × rate, project and task); tick
-   them and add them as one line or each as its own line.
+2. On a customer's new invoice, **+ Billable items** lists their hours, one
+   per time entry (date, person, hours × rate, project and task); tick them
+   and add them as one line or each as its own line.
 3. Give those invoice lines your usual revenue category: the invoice posts
    the revenue (and the receivable) then.
 
-Any other module finds billed hours the same way, without reading this
-module's tables:
+When the invoice is issued, Sales tags the hours' transactions **billed**:
+the hours show *billed* here, can't be changed, and are billed in
+timesheet.io. Voiding the invoice takes the tag off and frees them.
 
-- list the entries of the billable hours account
-  (`ctx.ledger.listJournalEntries({ accountCode })`) and take the debit lines
-  on it;
-- the customer is the entry's `entity` (`{ id, name }`);
-- the entry carries Ledger's shared tags `billed` and `customer` (the
-  customer's entity), so `ctx.tags.entries({ tag: "billed", entity_id })`
-  finds it (Ledger ≥ 0.23.0; see *Tags* below);
-- the link `{ ref: "time:<id>" }` names the time entry (label: date, person
-  and hours; it opens the billing here). The older mark, the link
-  `{ module_id: "employees", ref: "billed", label: "Billed" }`, is still set
-  as well for now, for Sales versions that look for it;
-- the reference is `HOURS-<time entry id>`; the debit line's memo is the
-  item: `2026-11-12 · Ana Silva · 7.00 h × 120.00 · Website rebuild: Task t2`
-  (the credit line's is "Offset: revenue only once invoiced").
+Any other module finds the hours the same way, without reading this module's
+tables:
 
-Earlier billings stay as posted: 0.4.0 and 0.5.0 posted to revenue (0.4.0 to
-accounts receivable too), and 0.6.0 to 0.8.0 to a *Billable hours* account the
-module made (usually 1250). Keep that account in Sales' billable costs until
-its hours are invoiced; unbilling one reverses it as usual.
+- the debit lines of the clearing account
+  (`ctx.ledger.listJournalEntries({ accountCode })`), on entries neither
+  reversed nor reversals;
+- the customer is the entry's `entity`, and the shared tags say the rest:
+  `customer` (entity), `employee` and `project` (note: the name), and
+  `billed` / `paid` once someone sets them;
+- the link `{ ref: "time:<id>" }` names the time entry; the reference is
+  `HOURS-<time entry id>`; the debit line's memo is the item:
+  `2026-11-12 · Ana Silva · 7.00 h × 120.00 · Website rebuild: Task t2`.
 
-An unbilled entry is reversed (`reversed_by_id` is set) and loses its tags
-(`billed`, `customer`) and its Billed link. Billings made before 0.4.0 are
-one entry for the whole billing; they get the tags and the Billed link too
-(when the module starts) and are linked as `billing:<id>`.
+**Billings made before 0.12.0 stay as they were**, billed (0.11.0 tagged them
+`billed` itself; 0.6.0 to 0.8.0 posted to a *Billable hours* account the module
+made, usually 1250, which stays in Sales' billable costs until those hours are
+invoiced). Their hours show *billed* on the Time tab; a journal entry's link
+still opens the billing.
 
 ## Tags
 
-Since 0.11.0 the module uses the tags on journal entries that Ledger 0.23.0
-shares between itself and every module. On an older Ledger it works as
-before, without them.
+The module uses the tags on journal entries that Ledger shares between itself
+and every module (Ledger ≥ 0.23.0).
 
-- **What it sets.** When hours are billed, each time entry's transaction is
-  tagged `billed` (note: `Employees billing <id>`) and `customer` (the
-  project's customer). Unbilling a time entry or reversing a billing takes
-  both off again. Entries billed before 0.11.0, or on an older Ledger, are
-  tagged when the module next starts. Pay runs get no tag: a pay run's entry
-  already pays the net pay, there is no later payment to record, and it has no
-  customer or vendor.
+- **What it sets.** On each billable hours transaction: `customer` (the
+  project's customer), `employee` and `project` (the names, as notes). On each
+  of a pay run's cost entries: `project` and its `customer`. When a
+  transaction is replaced, its tags come off the old one.
 - **What it follows.** A tag belongs to the transaction, so Sales, another
-  module or a person (on the transaction's page) can set or remove it, and the
-  module's record follows. It never posts or reverses anything because of a
-  tag.
-  - `paid` on a billing's transaction: the billing shows *paid* (or *partly
-    paid* when only some of its transactions are). The module only shows it.
-  - `billed` set on a transaction the module posted for hours that aren't
-    billed here (one whose billing was reversed, say): those hours count as
-    billed (*Billed by tag* on the Billable hours tab, and billed in
-    timesheet.io) and aren't offered for billing until the tag is taken off.
-  - `billed` taken off a billing's transaction: its hours leave the billing
-    and are billable again (a billing with nothing left shows as reversed).
-    The transaction itself stays as it is; billing those hours here again
-    reverses it and posts a new one, and putting the tag back marks them
-    billed again. A billing from before 0.4.0 ignores this: reverse it
-    instead.
+  module or a person can set or remove it, and the hours follow. Nothing is
+  posted or reversed because of a tag.
+  - `billed` on an hours transaction: the hours are billed and locked here
+    (and billed in timesheet.io); taken off, they are open again.
+  - `paid` on it: the hours show *paid*; taken off, they don't.
+  - On a billing from before 0.12.0: `paid` shows on the billing, and
+    `billed` taken off frees its hours as before.
+
+  Tags changed while Ledger was down are read again when the module starts.
 
 ## timesheet.io
 

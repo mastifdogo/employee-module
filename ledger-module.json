@@ -1,9 +1,9 @@
 {
   "id": "employees",
   "name": "Employees",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Track employee time, bill customers for billable hours and run payroll, with time pulled from timesheet.io.",
-  "ledger": ">=0.21.1",
+  "ledger": ">=0.23.0",
   "server": "server.mjs",
   "ui": "ui",
   "nav": {
@@ -24,7 +24,7 @@
       { "key": "wages_expense_account", "label": "Wages expense", "type": "account", "account_types": ["expense"], "help": "Debited with gross pay when a pay run is posted." },
       { "key": "employer_cost_account", "label": "Employer payroll costs", "type": "account", "account_types": ["expense"], "help": "The employer's share: pension, insurance, payroll taxes." },
       { "key": "payroll_liabilities_account", "label": "Payroll liabilities", "type": "account", "account_types": ["liability"], "help": "Credited with amounts withheld from pay and the employer's share, until they are remitted." },
-      { "key": "h_billable", "label": "Billable hours", "type": "heading", "tab": "billing", "help": "Billed hours go to a clearing account the module makes when you first bill (CLR-EMPLOYEES-BILLABLE): a debit with the customer and an equal credit, so nothing is revenue until invoiced. Add it under Settings → Sales → Billable costs." },
+      { "key": "h_billable", "label": "Billable hours", "type": "heading", "tab": "billing", "help": "Billable hours go by themselves to a clearing account (CLR-EMPLOYEES-BILLABLE), one transaction per time entry tagged with customer, employee and project. Add it under Settings → Sales → Billable costs." },
       { "key": "timesheet_api_key", "label": "API key", "type": "secret", "tab": "timesheet", "help": "Create one at my.timesheet.io → Development → API keys. It looks like ts_xxxx.yyyy." },
       { "key": "timesheet_time_zone", "label": "Time zone", "type": "text", "tab": "timesheet", "default": "", "help": "For time entered in Ledger, which starts at 9:00 there, e.g. America/Toronto. Empty: UTC." },
       { "key": "timesheet_sync_days", "label": "Days to pull", "type": "number", "tab": "timesheet", "min": 1, "max": 730, "default": 60, "help": "Each sync re-reads this many days back, so edits made in timesheet.io are picked up." },

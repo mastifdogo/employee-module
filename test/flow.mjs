@@ -131,40 +131,79 @@ made = (await mockTasks()).find((t) => t.description === "Hand-entered" && !t.de
 assert.equal(made.user, "u-ben");
 step("hand-entered time sent to timesheet.io (and moved between people)");
 
-// Billing
-await ok(call("GET", `/api/v1/accounts/${BILLABLE}`), 404); // no clearing account yet: billing makes it
-const bill = await ok(m("POST", "/billings", { customer_entity_id: acme.id, period_start: day(30), period_end: day(0) }), 201);
-assert.equal(bill.total_minutes, 180 + 420 + 120);
-assert.equal(bill.total_cents, 12 * 12000);
-assert.equal(bill.status, "posted");
-assert.equal(bill.journal_entry_id, null); // one journal entry per time entry, not one per billing
-const billedT2 = await entryBy((t) => t.id === t2.id);
-assert.ok(billedT2.billing_journal_entry_id);
-const entry = await ok(call("GET", `/api/v1/journal-entries/${billedT2.billing_journal_entry_id}`));
+// Billable hours go to the clearing account by themselves: one transaction per time entry, tagged customer, employee and project
+const sortCents = async (id) => (await salesItems(id)).map((x) => x.cents).sort((a, b) => a - b);
+const t2c = await entryBy((t) => t.id === t2.id);
+assert.equal(t2c.clearing_status, "posted");
+const entry = await journal(t2c.clearing_entry_id);
 assert.equal(entry.entity?.name, "Acme Corp");
-assert.deepEqual(entry.lines.map((l) => [l.account_code, Number(l.debit_cents), Number(l.credit_cents)]), [[BILLABLE, 84000, 0], [BILLABLE, 0, 84000]]); // 7 h at 120.00, debit and offset in the clearing account
+assert.deepEqual(entry.lines.map((l) => [l.account_code, Number(l.debit_cents), Number(l.credit_cents)]), [[BILLABLE, 84000, 0], [BILLABLE, 0, 84000]]); // 7 h at 120.00, debit and offset
+assert.equal(entry.lines[0].memo, `${day(2)} · Ana S. · 7.00 h × 120.00 · Website rebuild: Edited in Ledger`);
+assert.equal(entry.entry_date, day(2)); // the day the work was done
 const billAcct = await ok(call("GET", `/api/v1/accounts/${BILLABLE}`));
 assert.deepEqual([billAcct.name, billAcct.type, billAcct.kind, billAcct.currency, Number(billAcct.balance_cents)], ["Billable hours", "asset", "clearing", "CAD", 0]);
 assert.equal(Number((await ok(call("GET", "/api/v1/accounts/4100"))).balance_cents), 0); // nothing is revenue yet
 assert.equal((await ok(m("GET", "/accounts"))).data.some((x) => x.code === BILLABLE), false); // hidden clearing account: not in pickers
 assert.equal((await ok(m("GET", "/summary"))).billable_hours.code, BILLABLE);
-assert.equal(entry.lines[0].memo, `${day(2)} · Ana S. · 7.00 h × 120.00 · Website rebuild: Edited in Ledger`);
-const acmeItems = await salesItems(acme.id);
-assert.deepEqual(acmeItems.map((i) => i.cents).sort(), [24000, 36000, 84000]); // one item per time entry, for Sales to invoice
-assert.deepEqual(entry.links.map((l) => [l.module_id, l.ref, l.label]).sort(), [["employees", "billed", "Billed"], ["employees", `time:${t2.id}`, `Hours ${day(2)} · Ana S. · 7.00 h`]]);
-assert.deepEqual(await tagsOf(entry.id), [["billed", "employees", null], ["customer", "employees", "Acme Corp"]]); // Ledger's shared tags: billed, and who it is with
-assert.equal(entry.tags.find((t) => t.tag === "billed").note, `Employees billing ${bill.id}`);
-assert.equal(bill.paid, null);
-await ok(m("POST", "/billings", { customer_entity_id: acme.id, period_start: day(30), period_end: day(0) }), 422); // nothing left
-await ok(m("PATCH", `/time/${t2.id}`, { bill_rate_cents: 1 }), 409);
-const globex = await ok(m("POST", "/billings", { customer_entity_id: cust.id, period_start: day(30), period_end: day(0) }), 201);
-assert.equal(globex.total_cents, 30000); // 2 h at the project's 150.00
+assert.deepEqual(await tagsOf(entry.id), [["customer", "employees", "Acme Corp"], ["employee", "employees", null], ["project", "employees", null]]);
+assert.deepEqual(entry.tags.filter((t) => t.tag !== "customer").map((t) => [t.tag, t.note]).sort(), [["employee", "Ana S."], ["project", "Website rebuild"]]);
+assert.deepEqual(await sortCents(acme.id), [24000, 36000, 84000]); // t4, t1, t2: one item per time entry, for Sales to invoice
 assert.deepEqual(await salesItems(cust.id), [{ memo: `${day(4)} · Ana S. · 2.00 h × 150.00 · Audit: Review`, cents: 30000 }]);
-assert.equal((await ok(m("GET", `/billings/${bill.id}`))).lines.length, 3);
+// Changed: the old transaction is reversed (its tags come off) and a new one posted
+const t4 = await entryBy((t) => t.description === "Task t4");
+await ok(m("PATCH", `/time/${t4.id}`, { minutes: 150 }));
+const t4b = await entryBy((t) => t.id === t4.id);
+assert.notEqual(String(t4b.clearing_entry_id), String(t4.clearing_entry_id));
+assert.notEqual((await journal(t4.clearing_entry_id)).reversed_by_id, null);
+assert.deepEqual(await tagsOf(t4.clearing_entry_id), []);
+assert.deepEqual(await sortCents(acme.id), [30000, 36000, 84000]);
+await ok(m("PATCH", `/time/${t4.id}`, { minutes: 120 }));
+// A new project rate reprices its hours; a new customer moves them
+await ok(m("PATCH", `/projects/${web.id}`, { bill_rate_cents: 13000 }));
+assert.deepEqual(await sortCents(acme.id), [26000, 39000, 91000]);
+await ok(m("PATCH", `/projects/${web.id}`, { customer_entity_id: cust.id }));
+assert.deepEqual([await sortCents(acme.id), (await sortCents(cust.id)).length], [[], 4]);
+await ok(m("PATCH", `/projects/${web.id}`, { customer_entity_id: acme.id, bill_rate_cents: 12000 }));
+assert.deepEqual(await sortCents(acme.id), [24000, 36000, 84000]);
+// Not billable: out of the clearing account; billable again: back in
+const t1 = await entryBy((t) => t.description === "Task t1");
+await ok(m("PATCH", `/time/${t1.id}`, { billable: false }));
+assert.deepEqual([(await entryBy((t) => t.id === t1.id)).clearing_status, (await entryBy((t) => t.id === t1.id)).clearing_entry_id], ["none", null]);
+assert.deepEqual(await sortCents(acme.id), [24000, 84000]);
+await ok(m("PATCH", `/time/${t1.id}`, { billable: true }));
+assert.deepEqual(await sortCents(acme.id), [24000, 36000, 84000]);
+// Billable without a customer: stays out, and says why
+const noCustomer = await ok(m("POST", "/time", { employee_id: ana.id, project_id: ops.id, work_date: day(7), minutes: 30, billable: true, description: "Billable, no customer" }), 201);
+const nc = await entryBy((t) => t.id === noCustomer.id);
+assert.deepEqual([nc.clearing_status, nc.clearing_error], ["none", "the project Internal ops has no customer"]);
+await ok(m("DELETE", `/time/${noCustomer.id}`), 204);
+// Deleted: its transaction is reversed
+const extra = await ok(m("POST", "/time", { employee_id: ana.id, project_id: web.id, work_date: day(7), minutes: 60, billable: true, description: "Deleted again" }), 201);
+const extraEntry = (await entryBy((t) => t.id === extra.id)).clearing_entry_id;
+assert.deepEqual(await sortCents(acme.id), [12000, 24000, 36000, 84000]);
+await ok(m("DELETE", `/time/${extra.id}`), 204);
+assert.notEqual((await journal(extraEntry)).reversed_by_id, null);
+assert.deepEqual(await sortCents(acme.id), [24000, 36000, 84000]);
+assert.equal(Number((await ok(call("GET", `/api/v1/accounts/${BILLABLE}`))).balance_cents), 0);
 await settle();
-for (const id of ["t1", "t2", "t4"]) assert.equal((await mt(id)).billed, true, id);
-assert.equal((await mt("t3")).billed, false);
-step("billable hours billed and posted, linked to the customer; billed in timesheet.io");
+step("billable hours go to the clearing account by themselves, tagged customer, employee and project, and follow every change");
+
+// Sales invoices them: it tags their transactions "billed" (a person does the same here); "paid" follows too
+const t1c = (await entryBy((t) => t.id === t1.id)).clearing_entry_id;
+await tagAs(t1c, "billed");
+await until("tagged hours are billed", async () => String((await entryBy((t) => t.id === t1.id)).billed_tag_entry_id) === String(t1c));
+await ok(m("PATCH", `/time/${t1.id}`, { minutes: 200 }), 409); // billed: locked
+await ok(m("DELETE", `/time/${t1.id}`), 409);
+assert.ok((await ok(m("GET", "/time?show=billed"))).data.some((t) => t.id === t1.id));
+assert.equal((await ok(m("GET", "/time?show=in_clearing"))).data.some((t) => t.id === t1.id), false);
+assert.equal((await ok(m("GET", `/calendar?from=${day(3)}&to=${day(3)}&show=billed`))).data.length, 1);
+await tagAs(t1c, "paid");
+await until("paid shows on the hours", async () => (await entryBy((t) => t.id === t1.id)).billing_paid === true);
+await untagAs(t1c, "paid");
+await until("and goes again", async () => (await entryBy((t) => t.id === t1.id)).billing_paid === false);
+await settle();
+assert.equal((await mt("t1")).billed, true);
+step("tagged billed (an invoice bills them): hours billed and locked, billed in timesheet.io; paid follows its tag");
 
 // Ledger wins: a change not yet sent (timesheet.io refuses the key meanwhile) and billed time keep Ledger's version
 const b9 = await entryBy((t) => t.description === "Task bulk9");
@@ -184,92 +223,19 @@ await fetch(`${mock}/__tasks`, { method: "POST", body: JSON.stringify(changed) }
 await ok(call("PUT", "/api/v1/modules/employees/settings", { values: { timesheet_api_key: "ts_test.secret123" } }));
 const s3 = await settle();
 assert.deepEqual([s3.added, s3.updated, s3.removed, s3.kept, s3.sent], [0, 1, 1, 1, 2], s3.summary);
-assert.equal((await mt("t1")).description, "Task t1"); // billed here: Ledger's version sent back
+assert.equal((await mt("t1")).description, "Task t1"); // billed: Ledger's version sent back
 assert.equal((await mt("bulk9")).description, "Ledger wins");
 assert.equal((await entryBy((t) => t.description === "Task t3")).minutes, 150); // only changed there: taken
 step("changed in both places: Ledger wins; changed only in timesheet.io: taken");
 
-await ok(m("POST", `/billings/${bill.id}/reverse`));
-await ok(m("POST", `/billings/${bill.id}/reverse`), 409);
-assert.notEqual((await ok(call("GET", `/api/v1/journal-entries/${billedT2.billing_journal_entry_id}`))).reversed_by_id, null);
-assert.equal((await ok(m("GET", "/time?show=billable"))).data.length, 3);
+// The invoice is voided: "billed" comes off, the hours are open again (nothing is posted for a tag)
+await untagAs(t1c, "billed");
+await until("untagged hours are open again", async () => (await entryBy((t) => t.id === t1.id)).billed_tag_entry_id === null);
+assert.equal((await journal(t1c)).reversed_by_id, null);
+assert.equal(String((await entryBy((t) => t.id === t1.id)).clearing_entry_id), String(t1c));
 await settle();
 assert.equal((await mt("t1")).billed, false);
-assert.equal((await ok(call("GET", `/api/v1/journal-entries/${billedT2.billing_journal_entry_id}`))).links.some((l) => l.ref === "billed"), false); // reversed: no longer tagged Billed
-assert.deepEqual(await tagsOf(billedT2.billing_journal_entry_id), []); // nor tagged billed or with the customer
-assert.deepEqual(await salesItems(acme.id), []); // reversed: no longer offered for invoicing
-step("billing reversed; hours billable again, and not billed in timesheet.io");
-
-// Batch: bill chosen time entries at once; what can't be billed is skipped with the reason
-const pick = await Promise.all(["Task t1", "Edited in Ledger", "Task t4", "Task t3"].map((d) => entryBy((t) => t.description === d)));
-await ok(m("POST", "/billings/batch", { entry_ids: [] }), 422);
-await ok(m("POST", "/billings/batch", { entry_ids: [pick[3].id] }), 422); // t3 isn't billable: nothing to bill
-const batch = await ok(m("POST", "/billings/batch", { entry_ids: pick.map((t) => t.id), billing_date: day(0) }), 201);
-assert.equal(batch.billed, 3);
-assert.equal(batch.total_cents, 12 * 12000);
-assert.equal(batch.billings.length, 1); // one customer
-assert.deepEqual(batch.skipped.map((x) => [x.id, x.reason]), [[pick[3].id, "not billable"]]);
-await ok(m("POST", "/billings/batch", { entry_ids: [pick[0].id] }), 422); // already billed
-const batchT1 = await entryBy((t) => t.id === pick[0].id);
-assert.ok((await ok(call("GET", `/api/v1/journal-entries/${batchT1.billing_journal_entry_id}`))).links.some((l) => l.ref === "billed" && l.label === "Billed"));
-// Batch unbill: those entries' transactions are reversed and lose the tag; the billing keeps the rest
-const batchT2 = (await entryBy((t) => t.id === pick[1].id)).billing_journal_entry_id;
-assert.deepEqual(await tagsOf(batchT2), [["billed", "employees", null], ["customer", "employees", "Acme Corp"]]);
-const unb = await ok(m("POST", "/billed/unbill", { entry_ids: [pick[1].id, pick[3].id] }));
-assert.deepEqual([unb.unbilled, unb.skipped.length], [1, 1]);
-assert.deepEqual(await tagsOf(batchT2), []); // unbilled: the tags go with the Billed link
-assert.deepEqual(await tagsOf(batchT1.billing_journal_entry_id), [["billed", "employees", null], ["customer", "employees", "Acme Corp"]]); // t1 keeps its own
-const reversed = await ok(call("GET", `/api/v1/journal-entries/${(await entryBy((t) => t.id === pick[0].id)).billing_journal_entry_id}`));
-assert.equal(reversed.reversed_by_id, null); // t1 is still billed
-const left = await ok(m("GET", `/billings/${batch.billings[0].id}`));
-assert.deepEqual([left.lines.length, Number(left.total_cents), left.status], [2, 5 * 12000, "posted"]);
-await ok(m("POST", "/billed/unbill", { entry_ids: [pick[0].id, pick[2].id] }));
-assert.equal((await ok(m("GET", `/billings/${batch.billings[0].id}`))).status, "reversed"); // nothing left on it
-assert.equal((await ok(m("GET", "/time?show=billable"))).data.length, 3);
-step("batch billing and batch unbill, one tagged transaction per time entry");
-
-// Shared tags set by others: a tag belongs to the entry, and the module's record follows it (nothing is posted for a tag)
-const before = await billableIds();
-assert.ok(before.includes(pick[0].id));
-await tagAs(batchT1.billing_journal_entry_id, "billed"); // a person says these (unbilled) hours were billed
-await until("tagged hours leave the billable list", async () => !(await billableIds()).includes(pick[0].id));
-assert.equal((await billableIds()).length, before.length - 1);
-assert.equal(String((await entryBy((t) => t.id === pick[0].id)).billed_tag_entry_id), String(batchT1.billing_journal_entry_id));
-assert.ok((await ok(m("GET", "/time?show=billed"))).data.some((t) => t.id === pick[0].id && t.billing_id === null));
-assert.match((await ok(m("POST", "/billings/batch", { entry_ids: [pick[0].id] }), 422)).error.message, /tagged Billed on transaction/); // not billed twice
-await settle();
-assert.equal((await mt("t1")).billed, true);
-await untagAs(batchT1.billing_journal_entry_id, "billed");
-await until("untagged hours are billable again", async () => (await billableIds()).includes(pick[0].id));
-// A billing's own entry: "paid" shows on the billing; "billed" taken off frees the hours without reversing the entry
-const own = await ok(m("POST", "/billings/batch", { entry_ids: [pick[2].id] }), 201);
-const ownEntry = (await entryBy((t) => t.id === pick[2].id)).billing_journal_entry_id;
-const ownBilling = () => ok(m("GET", `/billings/${own.billings[0].id}`));
-await tagAs(ownEntry, "paid");
-await until("the billing shows paid", async () => (await ownBilling()).paid === "paid");
-assert.equal((await ownBilling()).lines[0].billing_paid, true);
-await untagAs(ownEntry, "paid");
-await until("the billing shows not paid", async () => (await ownBilling()).paid === null);
-const entriesBefore = (await ok(call("GET", `/api/v1/journal-entries?account_code=${BILLABLE}&limit=500`))).data.length;
-await untagAs(ownEntry, "billed");
-await until("hours billed here are billable again", async () => (await billableIds()).includes(pick[2].id));
-assert.equal((await ownBilling()).status, "reversed"); // nothing left on it
-const freed = await journal(ownEntry);
-assert.deepEqual([freed.reversed_by_id, freed.links.some((l) => l.ref === "billed")], [null, false]); // not reversed: no entry is posted for a tag
-assert.equal((await ok(call("GET", `/api/v1/journal-entries?account_code=${BILLABLE}&limit=500`))).data.length, entriesBefore);
-await tagAs(ownEntry, "billed"); // put back: billed again, by the tag
-await until("re-tagged hours leave the billable list", async () => !(await billableIds()).includes(pick[2].id));
-await untagAs(ownEntry, "billed");
-await until("and come back", async () => (await billableIds()).includes(pick[2].id));
-const again = await ok(m("POST", "/billings/batch", { entry_ids: [pick[2].id] }), 201); // billed here again: the entry left behind is reversed, a new one posted
-assert.notEqual((await journal(ownEntry)).reversed_by_id, null);
-const newEntry = (await entryBy((t) => t.id === pick[2].id)).billing_journal_entry_id;
-assert.notEqual(String(newEntry), String(ownEntry));
-assert.deepEqual(await tagsOf(newEntry), [["billed", "employees", null], ["customer", "employees", "Acme Corp"]]);
-assert.deepEqual((await salesItems(acme.id)).map((i) => i.cents), [24000]); // one item for Sales, not two
-await ok(m("POST", `/billings/${again.billings[0].id}/reverse`));
-assert.deepEqual((await billableIds()).sort(), before.slice().sort());
-step("tags set by others: billed hides hours from billing, paid shows on the billing, removing billed frees them");
+step("billed taken off: hours open again, billed no more in timesheet.io");
 
 // Payroll
 await ok(m("POST", "/pay-runs", { period_start: "2020-01-01", period_end: "2019-01-01" }), 422);
@@ -289,12 +255,27 @@ await ok(m("POST", `/pay-runs/${run.id}/post`, {}), 422);
 await ok(m("POST", `/pay-runs/${run.id}/post`, { paid_from_account: "1000", wages_expense_account: "5200", payroll_liabilities_account: "2300", employer_cost_account: "nope!" }), 422);
 const posted = await ok(m("POST", `/pay-runs/${run.id}/post`, { paid_from_account: "1000", wages_expense_account: "5200", payroll_liabilities_account: "2300", employer_cost_account: "5210" }));
 assert.equal(posted.status, "posted");
-const pe = await ok(call("GET", `/api/v1/journal-entries/${posted.journal_entry_id}`));
-const amt = (code, side) => Number(pe.lines.find((l) => l.account_code === code)[side]);
-assert.equal(amt("5200", "debit_cents"), Number(edited.gross_cents));
-assert.equal(amt("5210", "debit_cents"), 15000);
-assert.equal(amt("2300", "credit_cents"), Number(edited.deductions_cents) + 15000);
-assert.equal(amt("1000", "credit_cents"), Number(edited.net_cents));
+const WAGES = "CLR-EMPLOYEES-WAGES"; // the Wages payable clearing account
+const amt = (e, code, side) => e.lines.filter((l) => l.account_code === code).reduce((a, l) => a + Number(l[side]), 0);
+const pe = await journal(posted.journal_entry_id);
+assert.equal(amt(pe, WAGES, "debit_cents"), Number(edited.gross_cents) + 15000);
+assert.equal(amt(pe, "2300", "credit_cents"), Number(edited.deductions_cents) + 15000);
+assert.equal(amt(pe, "1000", "credit_cents"), Number(edited.net_cents));
+// The cost per project: hourly pay split by the hours on the run, salaries apart
+// Ana 71 h: Audit 2 h, Website rebuild 10 h, Internal ops 59 h; Ben 5.5 h: Website rebuild 2 h, Internal ops 3.5 h; Cleo: salary
+const byProject = Object.fromEntries((await ok(m("GET", `/pay-runs/${run.id}`))).costs.map((c) => [c.project_name ?? "-", [Number(c.gross_cents), Number(c.employer_cost_cents)]]));
+assert.deepEqual(byProject, { Audit: [8000, 0], "Internal ops": [253500, 0], "Website rebuild": [50000, 0], "-": [300000, 15000] });
+const costEntries = (await ok(call("GET", "/api/v1/journal-entries?account_code=5200&limit=50"))).data.filter((e) => e.reference === `PAYRUN-${run.id}`);
+assert.equal(costEntries.length, 4);
+assert.equal(costEntries.reduce((a, e) => a + amt(e, "5200", "debit_cents"), 0), Number(edited.gross_cents));
+const costOf = (what) => costEntries.find((e) => e.description.endsWith(`· ${what}`));
+assert.deepEqual(await tagsOf(costOf("Website rebuild").id), [["customer", "employees", "Acme Corp"], ["project", "employees", null]]);
+assert.equal(costOf("Website rebuild").entity?.name, "Acme Corp");
+assert.deepEqual(await tagsOf(costOf("Audit").id), [["customer", "employees", "Globex"], ["project", "employees", null]]);
+assert.deepEqual(await tagsOf(costOf("Internal ops").id), [["project", "employees", null]]); // no customer
+assert.deepEqual(await tagsOf(costOf("no project").id), []);
+assert.equal(amt(costOf("no project"), "5210", "debit_cents"), 15000);
+assert.equal(Number((await ok(call("GET", `/api/v1/accounts/${WAGES}`))).balance_cents), 0); // cleared by the pay run's own entry
 await ok(m("POST", `/pay-runs/${run.id}/post`, { paid_from_account: "1000" }), 409);
 await ok(m("DELETE", `/pay-runs/${run.id}`), 409);
 assert.equal((await ok(m("GET", "/time?show=unpaid"))).data.length, 0);
@@ -303,25 +284,26 @@ assert.equal((await mt("bulk3")).paid, true);
 assert.equal(made.id && (await mt(made.id)).paid, true);
 await ok(m("POST", `/pay-runs/${run.id}/reverse`));
 assert.ok((await ok(m("GET", "/time?show=unpaid"))).data.length > 100);
+for (const e of costEntries) assert.notEqual((await journal(e.id)).reversed_by_id, null); // every entry of it
+assert.equal(Number((await ok(call("GET", "/api/v1/accounts/5200"))).balance_cents), 0);
 await settle();
 assert.equal((await mt("bulk3")).paid, false);
 step("pay run drafted, edited, posted (balanced entry) and reversed; paid in timesheet.io and back");
 
 // Root mode: any record, through ctx.root (kept by Ledger, reversible); the books and timesheet.io are left alone
-const globexBilled = (await ok(m("GET", "/billings"))).data.find((b) => b.customer_name === "Globex" && b.status === "posted");
-await ok(m("DELETE", `/billings/${globexBilled.id}`), 403); // not in root mode
+await ok(m("DELETE", "/billings/999"), 403); // not in root mode
+const e1c = (await entryBy((t) => t.id === e1.id)).clearing_entry_id;
+await tagAs(e1c, "billed"); // an invoice bills it: locked
+await until("e1 is billed", async () => (await entryBy((t) => t.id === e1.id)).billed_tag_entry_id !== null);
+await ok(m("PATCH", `/time/${e1.id}`, { description: "x" }), 409);
 await ok(m("PATCH", `/time/${e1.id}/root`, { description: "x" }), 403);
 assert.equal((await ok(m("GET", "/summary"))).root, false);
 await ok(call("POST", "/api/v1/auth/root", { on: true }));
 assert.equal((await ok(m("GET", "/summary"))).root, true);
-assert.notEqual((await entryBy((t) => t.id === e1.id)).billing_id, null); // billed: normally locked
 await ok(m("PATCH", `/time/${e1.id}/root`, { description: "Changed in root mode" }));
 assert.equal((await entryBy((t) => t.id === e1.id)).description, "Changed in root mode");
-const globexEntry = (await entryBy((t) => t.id === e1.id)).billing_journal_entry_id;
-await ok(m("DELETE", `/billings/${globexBilled.id}`));
-assert.equal((await ok(m("GET", "/billings"))).data.some((b) => b.id === globexBilled.id), false);
-assert.equal((await entryBy((t) => t.id === e1.id)).billing_id, null); // billable again
-assert.equal((await ok(call("GET", `/api/v1/journal-entries/${globexEntry}`))).reversed_by_id, null); // its entry stays as it was
+await ok(m("DELETE", "/billings/999"), 404);
+assert.equal((await journal(e1c)).reversed_by_id, null); // the books are left alone
 const run2 = await ok(m("POST", "/pay-runs", { period_start: day(40), period_end: day(0), pay_date: day(0) }), 201);
 await ok(m("POST", `/pay-runs/${run2.id}/post`, { paid_from_account: "1000", wages_expense_account: "5200", payroll_liabilities_account: "2300", employer_cost_account: "5210" }));
 const benLine = run2.lines.find((l) => l.employee_name === "Ben Okafor");
@@ -334,10 +316,10 @@ await ok(m("GET", `/pay-runs/${run2.id}`), 404);
 assert.ok((await ok(m("GET", "/time?show=unpaid"))).data.length > 100); // its hours are unpaid again
 const log = await ok(call("GET", "/api/v1/root-actions"));
 const logText = JSON.stringify(log);
-for (const want of [`deleted posted billing ${globexBilled.id}`, `deleted posted pay run ${run2.id}`, `changed time entry ${e1.id}`]) assert.ok(logText.includes(want), want);
+for (const want of [`deleted posted pay run ${run2.id}`, `changed time entry ${e1.id}`]) assert.ok(logText.includes(want), want);
 await ok(call("POST", "/api/v1/auth/root", { on: false }));
 assert.equal((await ok(m("GET", "/summary"))).root, false);
-step("root mode: billed time changed, a billing and a posted pay run deleted, all logged by Ledger");
+step("root mode: billed time changed and a posted pay run deleted, all logged by Ledger");
 
 const sum = await ok(m("GET", "/summary"));
 assert.equal(sum.accounts.wages_expense_account, "5200");

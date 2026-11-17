@@ -128,6 +128,10 @@ export default async function register(ctx) {
 				...keys.map((k) => f[k]),
 			]);
 			if (rows.length === 0) throw new ctx.HttpError(404, "no such employee");
+			if (f.bill_rate_cents !== undefined || f.name !== undefined) {
+				await q(`UPDATE ${S}.time_entries t SET clearing_status = 'pending' WHERE t.employee_id = $1 AND t.billable AND ${UNBILLED}`, [id]);
+				await clearingFor(req);
+			}
 			await refreshTodos();
 			return rows[0];
 		} catch (e) {
@@ -193,6 +197,10 @@ export default async function register(ctx) {
 		if (keys.length === 0) throw bad("nothing to change");
 		const { rows } = await q(`UPDATE ${S}.projects SET ${keys.map((k, i) => `${k} = $${i + 2}`).join(", ")} WHERE id = $1 RETURNING ${PROJ}`, [id, ...keys.map((k) => f[k])]);
 		if (rows.length === 0) throw new ctx.HttpError(404, "no such project");
+		if (f.customer_entity_id !== undefined || f.bill_rate_cents !== undefined || f.name !== undefined) {
+			await q(`UPDATE ${S}.time_entries t SET clearing_status = 'pending' WHERE t.project_id = $1 AND t.billable AND ${UNBILLED}`, [id]);
+			await clearingFor(req);
+		}
 		await refreshTodos();
 		return rows[0];
 	});
@@ -203,7 +211,7 @@ export default async function register(ctx) {
 	// Not billed: neither on a billing here nor tagged "billed" by someone else (shared tags, below).
 	const UNBILLED = `t.billing_id IS NULL AND t.billed_tag_entry_id IS NULL`;
 	const TIME = `t.id, t.employee_id, e.name AS employee_name, t.project_id, p.name AS project_name, p.customer_entity_id, t.work_date, t.minutes,
-		t.description, t.billable, t.bill_rate_cents, t.source, t.billing_id, t.pay_run_id, t.push_status, t.push_error, t.timesheet_task_id IS NOT NULL AS in_timesheet, t.billing_journal_entry_id, t.billed_tag_entry_id, t.billing_paid,
+		t.description, t.billable, t.bill_rate_cents, t.source, t.billing_id, t.pay_run_id, t.push_status, t.push_error, t.timesheet_task_id IS NOT NULL AS in_timesheet, t.billing_journal_entry_id, t.billed_tag_entry_id, t.billing_paid, t.clearing_status, t.clearing_error, t.clearing_entry_id,
 		COALESCE(t.billed_rate_cents, ${RATE}) AS rate_cents,
 		COALESCE(t.billed_amount_cents, round(t.minutes * ${RATE} / 60.0)::bigint) AS amount_cents
 		FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id LEFT JOIN ${S}.projects p ON p.id = t.project_id`;
@@ -222,6 +230,7 @@ export default async function register(ctx) {
 		if (g("show") === "billable") where.push(`t.billable AND ${UNBILLED}`);
 		if (g("show") === "unpaid") where.push("t.pay_run_id IS NULL");
 		if (g("show") === "billed") where.push("(t.billing_id IS NOT NULL OR t.billed_tag_entry_id IS NOT NULL)");
+		if (g("show") === "in_clearing") where.push(`t.clearing_status = 'posted' AND ${UNBILLED}`);
 		const { rows } = await q(`SELECT ${TIME} ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY t.work_date DESC, t.id DESC LIMIT 1000`, params);
 		return { data: rows };
 	});
@@ -232,11 +241,25 @@ export default async function register(ctx) {
 		const to = req.query.get("to") ? reqDate(req.query.get("to"), "to") : today();
 		if (to < from || Date.parse(to) - Date.parse(from) > 800 * 86_400_000) throw bad("choose up to 800 days, from before to");
 		const params = [from, to];
-		if (req.query.get("employee_id")) params.push(idOf(req.query.get("employee_id"), "employee"));
+		const where = ["t.work_date BETWEEN $1 AND $2"];
+		const add = (sql, v) => {
+			params.push(v);
+			where.push(sql.replace("?", `$${params.length}`));
+		};
+		const g = (k) => req.query.get(k);
+		if (g("employee_id")) add("t.employee_id = ?", idOf(g("employee_id"), "employee"));
+		if (g("project_id") === "none") where.push("t.project_id IS NULL");
+		else if (g("project_id")) add("t.project_id = ?", idOf(g("project_id"), "project"));
+		if (g("customer_id")) add("p.customer_entity_id = ?", idOf(g("customer_id"), "customer"));
+		const SHOW = { billable: "t.billable", not_billable: "NOT t.billable", unbilled: `t.billable AND ${UNBILLED}`, billed: "(t.billing_id IS NOT NULL OR t.billed_tag_entry_id IS NOT NULL)", unpaid: "t.pay_run_id IS NULL" };
+		if (g("show")) {
+			if (!SHOW[g("show")]) throw bad(`show must be one of ${Object.keys(SHOW).join(", ")}`);
+			where.push(SHOW[g("show")]);
+		}
 		const { rows } = await q(
 			`SELECT t.work_date, t.employee_id, e.name AS employee_name, sum(t.minutes)::int AS minutes, COALESCE(sum(t.minutes) FILTER (WHERE t.billable), 0)::int AS billable_minutes
-			FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id
-			WHERE t.work_date BETWEEN $1 AND $2 ${params.length === 3 ? "AND t.employee_id = $3" : ""}
+			FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id LEFT JOIN ${S}.projects p ON p.id = t.project_id
+			WHERE ${where.join(" AND ")}
 			GROUP BY t.work_date, t.employee_id, e.name ORDER BY t.work_date, sum(t.minutes) DESC, e.name`,
 			params,
 		);
@@ -270,16 +293,18 @@ export default async function register(ctx) {
 		const f = await timeFields(body(req), false);
 		const keys = Object.keys(f);
 		const { rows } = await q(
-			`INSERT INTO ${S}.time_entries (${keys.join(", ")}, created_by, push_status) VALUES (${keys.map((_, i) => `$${i + 1}`).join(", ")}, $${keys.length + 1}, 'pending') RETURNING id`,
+			`INSERT INTO ${S}.time_entries (${keys.join(", ")}, created_by, push_status, clearing_status) VALUES (${keys.map((_, i) => `$${i + 1}`).join(", ")}, $${keys.length + 1}, 'pending', 'pending') RETURNING id`,
 			[...keys.map((k) => f[k]), req.user.username],
 		);
+		await clearingFor(req);
 		pushSoon(req);
 		return ctx.response(201, { id: rows[0].id });
 	});
 
 	async function openEntry(id) {
-		const { rows } = await q(`SELECT id, billing_id, pay_run_id, timesheet_task_id FROM ${S}.time_entries WHERE id = $1`, [id]);
+		const { rows } = await q(`SELECT id, billing_id, pay_run_id, timesheet_task_id, billed_tag_entry_id, clearing_entry_id FROM ${S}.time_entries WHERE id = $1`, [id]);
 		if (rows.length === 0) throw new ctx.HttpError(404, "no such time entry");
+		if (rows[0].billed_tag_entry_id !== null) throw new ctx.HttpError(409, "This time is billed: its transaction is tagged Billed (an invoice bills it). Void that invoice to change it.");
 		if (rows[0].billing_id !== null) throw new ctx.HttpError(409, "This time is already billed. Reverse the billing to change it.");
 		if (rows[0].pay_run_id !== null) throw new ctx.HttpError(409, "This time is on a pay run. Delete or reverse the pay run to change it.");
 		return rows[0];
@@ -304,11 +329,12 @@ export default async function register(ctx) {
 		// The billing rate is Ledger's own; anything else is sent to timesheet.io (Ledger wins).
 		const send = keys.some((k) => k !== "bill_rate_cents");
 		const { rowCount } = await q(
-			`UPDATE ${S}.time_entries SET ${keys.map((k, i) => `${k} = $${i + 2}`).join(", ")}, ${send ? "push_status = 'pending', push_error = '', " : ""}updated_at = now()
-			WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL`,
+			`UPDATE ${S}.time_entries SET ${keys.map((k, i) => `${k} = $${i + 2}`).join(", ")}, ${send ? "push_status = 'pending', push_error = '', " : ""}clearing_status = 'pending', updated_at = now()
+			WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL AND billed_tag_entry_id IS NULL`,
 			[id, ...keys.map((k) => f[k])],
 		);
 		if (rowCount === 0) throw new ctx.HttpError(409, "This time entry was just billed or paid.");
+		await clearingFor(req);
 		if (send) pushSoon(req);
 		return { id: entry.id };
 	});
@@ -324,16 +350,152 @@ export default async function register(ctx) {
 		const entry = await openEntry(id);
 		// Its task in timesheet.io is deleted too (queued, so a failed call is retried).
 		const { rows: gone } = await q(
-			`WITH gone AS (DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL RETURNING timesheet_task_id),
+			`WITH gone AS (DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL AND billed_tag_entry_id IS NULL RETURNING timesheet_task_id, clearing_entry_id),
 			queued AS (INSERT INTO ${S}.timesheet_deletions (task_id, requested_by) SELECT timesheet_task_id, $2 FROM gone WHERE timesheet_task_id IS NOT NULL ON CONFLICT (task_id) DO NOTHING)
-			SELECT timesheet_task_id FROM gone`,
+			SELECT timesheet_task_id, clearing_entry_id FROM gone`,
 			[id, req.user.username],
 		);
 		if (gone.length === 0) throw new ctx.HttpError(409, "This time entry was just billed or paid.");
+		// Its billable hours leave the clearing account (and so Sales' billable items).
+		await unclear(gone[0].clearing_entry_id, `Reversal: billable hours of time entry ${id} (deleted)`, req.user);
 		if (entry.timesheet_task_id) pushSoon(req);
 	});
 
-	// ---- billings: bill customers for billable hours ---------------------------------
+	const money2 = (cents) => (Number(cents) / 100).toFixed(2);
+	/** "2026-11-12 · Ana Silva · 7.00 h × 120.00 · Website rebuild: Task t2", the item an invoice shows. */
+	const itemMemo = (t, c) =>
+		[t.work_date, t.employee_name, `${hours(c.minutes)} h × ${money2(t.rate)}`, [t.project_name, t.description].filter(Boolean).join(": ")].filter(Boolean).join(" · ").slice(0, 500);
+
+	// Billed hours sit in this module's clearing account (Ledger ≥ 0.20.0): made on first use, asked for
+	// each time (people can renumber it), never stored. Each billed time entry is a debit (the billable
+	// item) and an equal credit there, so it stays at zero and nothing is revenue until invoiced.
+	const BILLABLE = { key: "billable", name: "Billable hours", type: "asset", description: "Made by the Employees module. Each billed time entry is a debit (the billable item, with the customer on the entry) and an equal credit here, so the balance stays at zero and nothing is revenue until the hours are invoiced. Add this account under Settings → Sales → Billable costs." };
+	const billableAccount = async (currency) => (await ctx.ledger.clearingAccount({ ...BILLABLE, currency })).code;
+	/** The clearing account if it has been made yet (without making it): { code, name } or null. */
+	async function billableAccountIfMade(currency) {
+		const a = (await ctx.ledger.clearingAccounts()).find((x) => x.module_id === ctx.id && x.module_key === BILLABLE.key && x.currency === currency);
+		return a ? { code: a.code, name: a.name } : null;
+	}
+
+	// ---- billable hours in the clearing account, kept up to date by themselves ----------------------
+	// Every billable time entry with a customer (its project's) and a rate has one live journal entry in
+	// the Billable hours clearing account: a debit (the item Sales invoices, details in its memo) and an
+	// equal credit, with the customer as the entry's entity and the shared tags customer, employee and
+	// project. A change to the hours reverses that entry and posts a new one; hours no longer billable
+	// lose it. Once the entry is tagged "billed" (Sales does that while an invoice bills it) the hours are
+	// billed and locked here, "paid" on it marks them paid; taking the tag off undoes that. Nothing is
+	// posted because of a tag.
+	const orgOf = (req) => req.user.organization?.id ?? 1;
+	/** Brings the clearing account up to date after a change (in this request's books, one job at a time). */
+	async function clearingFor(req) {
+		try {
+			await serial(orgOf(req), () => postClearing(req.user));
+		} catch (e) {
+			ctx.log.warn("could not update the clearing account", { error: String(e?.message ?? e) });
+		}
+	}
+	const tagSafely = (entryId, tag, opts, user) => (ctx.tags ? ctx.tags.set(entryId, tag, opts, user).catch((e) => tagWarn(`tag "${tag}" on`, entryId, e)) : null);
+	/** Reverses a time entry's clearing transaction (if it still stands) and takes its tags off. */
+	async function unclear(entryId, description, user) {
+		if (entryId === null || entryId === undefined) return;
+		await reverseEntryOf(entryId, description, user);
+		if (ctx.tags) for (const t of ["customer", "employee", "project"]) await ctx.tags.remove(entryId, t).catch(() => {});
+	}
+
+	/** Posts, replaces or reverses the clearing transactions of time entries marked pending (up to 500 at a time). */
+	async function postClearing(user) {
+		const n = { posted: 0, reversed: 0, failed: 0 };
+		const { rows } = await q(
+			`SELECT t.id, t.work_date, t.minutes, t.description, t.billable, t.clearing_entry_id, t.billing_id, t.billed_tag_entry_id, t.updated_at::text AS stamp,
+				e.name AS employee_name, p.name AS project_name, p.customer_entity_id, ${RATE} AS rate, round(t.minutes * ${RATE} / 60.0)::bigint AS amount
+			FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id LEFT JOIN ${S}.projects p ON p.id = t.project_id
+			WHERE t.clearing_status IN ('pending', 'failed') ORDER BY t.id LIMIT 500`,
+		);
+		if (rows.length === 0) return n;
+		const currency = currencyOf(await ctx.settings.get());
+		const customers = new Map();
+		let code = null;
+		for (const t of rows) {
+			let current = t.clearing_entry_id;
+			// The entry it now has; "posted" only if nobody changed the hours meanwhile (else it goes round again).
+			const done = (status, error = "") =>
+				q(
+					`UPDATE ${S}.time_entries SET clearing_entry_id = $3,
+						clearing_status = CASE WHEN updated_at::text = $2 THEN $4 ELSE clearing_status END,
+						clearing_error = CASE WHEN updated_at::text = $2 THEN $5 ELSE clearing_error END
+					WHERE id = $1`,
+					[t.id, t.stamp, current, status, String(error).slice(0, 500)],
+				);
+			try {
+				// Billed (invoiced, or on a billing from before 0.12.0): its transaction stays as it is.
+				if (t.billing_id !== null || t.billed_tag_entry_id !== null) {
+					await done(current === null ? "none" : "posted");
+					continue;
+				}
+				// Tagged "billed" a moment ago, before the tag reached the module: billed, left as it is.
+				if (current !== null && ctx.tags && (await ctx.tags.of(current).catch(() => [])).some((x) => x.tag === "billed")) {
+					await q(`UPDATE ${S}.time_entries SET billed_tag_entry_id = $2, clearing_status = 'posted', clearing_error = '', push_status = 'pending' WHERE id = $1`, [t.id, current]);
+					continue;
+				}
+				const reason =
+					!t.billable ? ""
+					: t.customer_entity_id === null ? (t.project_name ? `the project ${t.project_name} has no customer` : "no project, so no customer")
+					: t.rate <= 0n ? "no billing rate"
+					: t.amount <= 0n ? "its amount rounds to 0.00"
+					: null;
+				let customer = null;
+				if (reason === null) {
+					const key = String(t.customer_entity_id);
+					if (!customers.has(key)) customers.set(key, await ctx.entities.get(Number(t.customer_entity_id)).catch(() => null));
+					customer = customers.get(key);
+				}
+				if (current !== null) {
+					await unclear(current, `Reversal: billable hours of time entry ${t.id} (changed)`, user);
+					current = null;
+					n.reversed++;
+				}
+				if (reason !== null || !customer) {
+					await done("none", reason ?? "its customer isn't in Ledger's entity list any more");
+					continue;
+				}
+				code ??= await billableAccount(currency);
+				const entry = await ctx.ledger.createJournalEntry(
+					{
+						entry_date: t.work_date,
+						description: `Billable hours: ${customer.name} · ${t.employee_name} · ${t.work_date} (${hours(t.minutes)} h)`.slice(0, 500),
+						reference: `HOURS-${t.id}`,
+						entity_id: customer.id,
+						lines: [
+							// The debit is the billable item (an invoice line shows its memo); the credit offsets it in the
+							// same account, so nothing is revenue until the hours are invoiced.
+							{ account_code: code, debit_cents: t.amount, memo: itemMemo(t, t) },
+							{ account_code: code, credit_cents: t.amount, memo: "Offset: revenue only once invoiced" },
+						],
+						links: [{ ref: `time:${t.id}`, label: `Hours ${t.work_date} · ${t.employee_name} · ${hours(t.minutes)} h`.slice(0, 200), href: `/apps/employees?time=${t.id}` }],
+					},
+					user,
+				);
+				current = entry.id;
+				await done("posted");
+				n.posted++;
+				// Who it is with, who did it, and for what.
+				await tagSafely(entry.id, "customer", { entity_id: Number(customer.id) }, user);
+				await tagSafely(entry.id, "employee", { note: t.employee_name.slice(0, 200) }, user);
+				if (t.project_name) await tagSafely(entry.id, "project", { note: t.project_name.slice(0, 200) }, user);
+			} catch (e) {
+				await done("failed", String(e?.message ?? e)).catch(() => {});
+				n.failed++;
+			}
+		}
+		// More than 500: the rest next time.
+		if (rows.length === 500) {
+			const again = await postClearing(user);
+			for (const k of Object.keys(n)) n[k] += again[k];
+		}
+		return n;
+	}
+
+	// ---- billings: bill customers for billable hours (from before 0.12.0) -------------------
 	// Each billed time entry posts its own journal entry in this module's Billable hours clearing
 	// account: a debit (the item, details in its memo) and a credit of the same amount, with the
 	// customer as the entry's entity. Nothing reaches revenue until the hours are invoiced. An invoicing
@@ -376,11 +538,6 @@ export default async function register(ctx) {
 		}
 	}
 	const isPaid = (tags) => tags.some((t) => t.tag === "paid");
-	const idList = (v, name) => {
-		if (!Array.isArray(v) || v.length === 0) throw bad(`choose at least one ${name}`);
-		if (v.length > 2000) throw bad(`choose at most 2000 ${name}s at a time`);
-		return [...new Set(v.map((x) => idOf(x, name)))];
-	};
 	const billingHref = (id) => `/apps/employees?billing=${id}`;
 
 	/** Frees time entries from their billing: they are billable again (and timesheet.io is told). */
@@ -437,160 +594,6 @@ export default async function register(ctx) {
 		}
 	}
 
-	/**
-	 * Bills time entries: one billing per customer, one journal entry per time entry.
-	 * → { billings, billed, total_cents, skipped: [{ id, reason }] }. Throws only when nothing could be billed.
-	 */
-	async function billEntries(ids, { billingDate, acc, currency, user }) {
-		const { rows } = await q(
-			`SELECT t.id, t.work_date, t.minutes, t.description, t.billable, t.billing_id, t.billed_tag_entry_id, t.billing_journal_entry_id AS leftover_entry_id, e.name AS employee_name, p.name AS project_name, p.customer_entity_id,
-				${RATE} AS rate, round(t.minutes * ${RATE} / 60.0)::bigint AS amount
-			FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id LEFT JOIN ${S}.projects p ON p.id = t.project_id
-			WHERE t.id = ANY($1::bigint[]) ORDER BY t.work_date, t.id`,
-			[ids],
-		);
-		const skipped = [];
-		const found = new Set(rows.map((r) => String(r.id)));
-		for (const id of ids) if (!found.has(String(id))) skipped.push({ id: Number(id), reason: "no such time entry" });
-		const byCustomer = new Map();
-		for (const r of rows) {
-			const reason =
-				r.billing_id !== null ? "already billed"
-				: r.billed_tag_entry_id !== null ? `tagged Billed on transaction ${r.billed_tag_entry_id} outside Employees`
-				: !r.billable ? "not billable"
-				: r.customer_entity_id === null ? (r.project_name ? `the project ${r.project_name} has no customer` : "no project, so no customer")
-				: r.rate <= 0n ? "no billing rate"
-				: r.amount <= 0n ? "its amount rounds to 0.00"
-				: null;
-			if (reason) skipped.push({ id: Number(r.id), reason });
-			else {
-				const key = String(r.customer_entity_id);
-				if (!byCustomer.has(key)) byCustomer.set(key, []);
-				byCustomer.get(key).push(r);
-			}
-		}
-
-		const billings = [];
-		let billed = 0;
-		let total = 0n;
-		let failure = null;
-		for (const [customerId, list] of byCustomer) {
-			if (failure) {
-				for (const r of list) skipped.push({ id: Number(r.id), reason: `not billed: ${failure.message}` });
-				continue;
-			}
-			let entity;
-			try {
-				entity = await ctx.entities.get(Number(customerId));
-			} catch {
-				for (const r of list) skipped.push({ id: Number(r.id), reason: "its customer isn't in Ledger's entity list any more" });
-				continue;
-			}
-			const dates = list.map((r) => r.work_date).sort();
-			const { rows: made } = await q(
-				`INSERT INTO ${S}.billings (customer_entity_id, customer_name, period_start, period_end, billing_date, currency, created_by)
-				VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-				[entity.id, entity.name, dates[0], dates[dates.length - 1], billingDate, currency, user.username],
-			);
-			const billingId = made[0].id;
-			// Claimed in one statement, so a second batch can't bill the same time twice.
-			const { rows: claimed } = await q(
-				`UPDATE ${S}.time_entries t
-				SET billing_id = $2, billed_rate_cents = r.rate, billed_amount_cents = round(t.minutes * r.rate / 60.0)::bigint, billing_journal_entry_id = NULL, push_status = 'pending', push_error = '', updated_at = now()
-				FROM ${S}.time_entries t2
-				JOIN ${S}.employees e ON e.id = t2.employee_id
-				JOIN ${S}.projects p ON p.id = t2.project_id
-				CROSS JOIN LATERAL (SELECT COALESCE(t2.bill_rate_cents, p.bill_rate_cents, e.bill_rate_cents, 0) AS rate) r
-				WHERE t2.id = t.id AND t.id = ANY($1::bigint[]) AND p.customer_entity_id = $3 AND t.billable AND ${UNBILLED} AND r.rate > 0
-				RETURNING t.id, t.minutes, t.billed_amount_cents AS amount`,
-				[list.map((r) => r.id), billingId, entity.id],
-			);
-			const info = new Map(list.map((r) => [String(r.id), r]));
-			for (const r of list) if (!claimed.some((c) => String(c.id) === String(r.id))) skipped.push({ id: Number(r.id), reason: "billed or changed by someone else meanwhile" });
-			const posted = [];
-			for (let i = 0; i < claimed.length; i++) {
-				const c = claimed[i];
-				const t = info.get(String(c.id));
-				try {
-					// An entry left from when someone took the tag "billed" off it (the hours became billable
-					// again, see the tag listener): billing again replaces it, as unbilling would have.
-					if (t.leftover_entry_id !== null) await reverseEntryOf(t.leftover_entry_id, `Reversal: billable hours (time entry ${c.id}), billed again`, user);
-					const entry = await ctx.ledger.createJournalEntry(
-						{
-							entry_date: billingDate,
-							description: `Billable hours: ${entity.name} · ${t.employee_name} · ${t.work_date} (${hours(c.minutes)} h)`.slice(0, 500),
-							reference: `HOURS-${c.id}`,
-							entity_id: entity.id,
-							lines: [
-								// The debit is the billable item (an invoice line shows its memo); the credit offsets it
-								// in the same account, so the books don't change until the hours are invoiced.
-								{ account_code: acc.billable_hours_account, debit_cents: c.amount, memo: itemMemo(t, c) },
-								{ account_code: acc.billable_hours_account, credit_cents: c.amount, memo: "Offset: revenue only once invoiced" },
-							],
-							links: [
-								{ ref: `time:${c.id}`, label: `Hours ${t.work_date} · ${t.employee_name} · ${hours(c.minutes)} h`.slice(0, 200), href: billingHref(billingId) },
-								{ ...BILLED_TAG, href: billingHref(billingId) },
-							],
-						},
-						user,
-					);
-					await q(`UPDATE ${S}.time_entries SET billing_journal_entry_id = $2 WHERE id = $1`, [c.id, entry.id]);
-					posted.push(c);
-					// The shared tags: billed, and who it is with. A failure never undoes the billing; it is tagged at the next start.
-					if (await tagBilled(entry.id, entity.id, billingId, user)) await q(`UPDATE ${S}.time_entries SET billing_tagged = true WHERE id = $1`, [c.id]);
-				} catch (e) {
-					// Stop here (the same accounts would fail again); the rest become billable again.
-					failure = e;
-					const rest = claimed.slice(i).map((x) => x.id);
-					await unclaim(rest);
-					for (const id of rest) skipped.push({ id: Number(id), reason: `not billed: ${e?.message ?? e}` });
-					break;
-				}
-			}
-			if (posted.length === 0) {
-				await q(`DELETE FROM ${S}.billings WHERE id = $1`, [billingId]);
-				continue;
-			}
-			await q(`UPDATE ${S}.billings SET status = 'posted' WHERE id = $1`, [billingId]);
-			await retotal(billingId, user.username);
-			billings.push((await q(`SELECT ${BILL} FROM ${S}.billings WHERE id = $1`, [billingId])).rows[0]);
-			billed += posted.length;
-			total += posted.reduce((a, c) => a + BigInt(c.amount), 0n);
-		}
-		if (billed === 0) {
-			if (failure) throw failure;
-			const reasons = [...new Set(skipped.map((s) => s.reason))].slice(0, 3).join("; ");
-			throw bad(`Nothing to bill: ${reasons || "no time chosen"}.`);
-		}
-		return { billings, billed, total_cents: total, skipped };
-	}
-
-	const money2 = (cents) => (Number(cents) / 100).toFixed(2);
-	/** "2026-11-12 · Ana Silva · 7.00 h × 120.00 · Website rebuild: Task t2", the item an invoice shows. */
-	const itemMemo = (t, c) =>
-		[t.work_date, t.employee_name, `${hours(c.minutes)} h × ${money2(t.rate)}`, [t.project_name, t.description].filter(Boolean).join(": ")].filter(Boolean).join(" · ").slice(0, 500);
-
-	// Billed hours sit in this module's clearing account (Ledger ≥ 0.20.0): made on first use, asked for
-	// each time (people can renumber it), never stored. Each billed time entry is a debit (the billable
-	// item) and an equal credit there, so it stays at zero and nothing is revenue until invoiced.
-	const BILLABLE = { key: "billable", name: "Billable hours", type: "asset", description: "Made by the Employees module. Each billed time entry is a debit (the billable item, with the customer on the entry) and an equal credit here, so the balance stays at zero and nothing is revenue until the hours are invoiced. Add this account under Settings → Sales → Billable costs." };
-	const billableAccount = async (currency) => (await ctx.ledger.clearingAccount({ ...BILLABLE, currency })).code;
-	/** The clearing account if it has been made yet (without making it): { code, name } or null. */
-	async function billableAccountIfMade(currency) {
-		const a = (await ctx.ledger.clearingAccounts()).find((x) => x.module_id === ctx.id && x.module_key === BILLABLE.key && x.currency === currency);
-		return a ? { code: a.code, name: a.name } : null;
-	}
-
-	async function billingSetup(b) {
-		const settings = await ctx.settings.get();
-		const currency = currencyOf(settings);
-		return {
-			billingDate: b.billing_date === undefined ? today() : reqDate(b.billing_date, "billing date"),
-			acc: { billable_hours_account: await billableAccount(currency) },
-			currency,
-		};
-	}
-
 	ctx.route("GET", "/billings", async () => {
 		await settleBillings();
 		const { rows } = await q(`SELECT ${BILL} FROM ${S}.billings ORDER BY id DESC LIMIT 200`);
@@ -604,52 +607,6 @@ export default async function register(ctx) {
 		const lines = await q(`SELECT ${TIME} WHERE t.billing_id = $1 ORDER BY t.work_date, t.id`, [id]);
 		return { ...rows[0], lines: lines.rows };
 	});
-
-	// Bill one customer's unbilled billable hours in a period.
-	ctx.route("POST", "/billings", async (req) => {
-		const b = body(req);
-		const entity = await customer(idOf(b.customer_entity_id, "customer"));
-		const from = reqDate(b.period_start, "from");
-		const to = reqDate(b.period_end, "to");
-		if (to < from) throw bad("the period ends before it starts");
-		const setup = await billingSetup(b);
-		const { rows } = await q(
-			`SELECT t.id FROM ${S}.time_entries t JOIN ${S}.projects p ON p.id = t.project_id
-			WHERE p.customer_entity_id = $1 AND t.billable AND ${UNBILLED} AND t.work_date BETWEEN $2 AND $3`,
-			[entity.id, from, to],
-		);
-		if (rows.length === 0) throw bad(`${entity.name} has no unbilled billable hours from ${from} to ${to}.`);
-		const r = await billEntries(rows.map((x) => x.id), { ...setup, user: req.user });
-		pushSoon(req);
-		return ctx.response(201, { ...r.billings[0], skipped: r.skipped });
-	});
-
-	// Batch: bill the chosen time entries, for any number of customers.
-	ctx.route("POST", "/billings/batch", async (req) => {
-		const b = body(req);
-		const ids = idList(b.entry_ids, "time entry");
-		const r = await billEntries(ids, { ...(await billingSetup(b)), user: req.user });
-		pushSoon(req);
-		return ctx.response(201, r);
-	});
-
-	/** Billed time entries with their own journal entry; the others are skipped with a reason. */
-	async function billedEntries(ids) {
-		const { rows } = await q(
-			`SELECT t.id, t.billing_id, t.billing_journal_entry_id FROM ${S}.time_entries t WHERE t.id = ANY($1::bigint[])`,
-			[ids],
-		);
-		const skipped = [];
-		const ok = [];
-		const found = new Set(rows.map((r) => String(r.id)));
-		for (const id of ids) if (!found.has(String(id))) skipped.push({ id: Number(id), reason: "no such time entry" });
-		for (const r of rows) {
-			if (r.billing_id === null) skipped.push({ id: Number(r.id), reason: "not billed" });
-			else if (r.billing_journal_entry_id === null) skipped.push({ id: Number(r.id), reason: "billed before each time entry had its own transaction: reverse its whole billing instead" });
-			else ok.push(r);
-		}
-		return { ok, skipped };
-	}
 
 	/** Reverses a record's journal entry unless it already is (or a restore left none). */
 	async function reverseEntryOf(entryId, description, user) {
@@ -682,16 +639,6 @@ export default async function register(ctx) {
 		for (const id of billingIds) await retotal(id, user.username);
 		return done.length;
 	}
-
-	// Batch: unbill chosen time entries.
-	ctx.route("POST", "/billed/unbill", async (req) => {
-		const ids = idList(body(req).entry_ids, "time entry");
-		const { ok, skipped } = await billedEntries(ids);
-		if (ok.length === 0) throw bad(`Nothing to unbill: ${[...new Set(skipped.map((s) => s.reason))].slice(0, 3).join("; ")}.`);
-		const unbilled = await unbill(ok, req.user);
-		pushSoon(req);
-		return { unbilled, skipped };
-	});
 
 	ctx.route("DELETE", "/billings/:id", async (req) => {
 		const id = paramId(req, "billing");
@@ -742,12 +689,85 @@ export default async function register(ctx) {
 	}
 
 	ctx.route("GET", "/pay-runs", async () => {
-		await settle("pay_runs", "payrun", (id) => q(`UPDATE ${S}.pay_runs SET status = 'draft' WHERE id = $1 AND status = 'posting'`, [id]));
+		await settle("pay_runs", "payrun", async (id) => {
+			await reverseCosts(id, `Reversal: pay run ${id} (not posted)`);
+			await q(`UPDATE ${S}.pay_runs SET status = 'draft' WHERE id = $1 AND status = 'posting'`, [id]);
+		});
 		const { rows } = await q(`SELECT ${RUN}, ${RUN_TOTALS} FROM ${S}.pay_runs r ORDER BY r.id DESC LIMIT 200`);
 		return { data: rows };
 	});
 
-	ctx.route("GET", "/pay-runs/:id", async (req) => getRun(paramId(req, "pay run")));
+	ctx.route("GET", "/pay-runs/:id", async (req) => {
+		const run = await getRun(paramId(req, "pay run"));
+		// What it costs per project and customer (how its entries are, or will be, split and tagged). A
+		// reversed run has let go of its hours, so the split can't be worked out again: its entries say it.
+		const costs = (run.status === "reversed" ? [] : await costGroups(run.id)).map((g) => ({ project_id: g.project?.id ?? null, project_name: g.project?.name ?? null, customer_entity_id: g.project?.customer_entity_id ?? null, gross_cents: g.gross, employer_cost_cents: g.employer }));
+		return { ...run, costs };
+	});
+
+	const wagesAccount = async (currency) =>
+		(
+			await ctx.ledger.clearingAccount({
+				key: "wages",
+				name: "Wages payable",
+				currency,
+				type: "liability",
+				description: "Made by the Employees module. A pay run books its wages and employer cost here per project (tagged with the customer and project), then clears it to payroll liabilities and the account pay comes from, so it returns to zero.",
+			})
+		).code;
+
+	/** Reverses the cost entries of a pay run (one per project) that still stand. */
+	async function reverseCosts(id, description, user) {
+		for (const l of await ctx.ledger.linkedEntries(`payrun-cost:${id}`)) if (!l.reversed) await reverseEntryOf(l.entry_id, description, user);
+	}
+
+	/**
+	 * A pay run's gross pay and employer cost per project: each hourly line split by the hours on the run
+	 * (to the cent; the last share takes the rounding), salaries and hours without a project in one group.
+	 * → [{ project: { id, name, customer_entity_id } | null, gross, employer }] (bigint cents).
+	 */
+	async function costGroups(id) {
+		const { rows } = await q(
+			`SELECT l.id, l.gross_cents, l.employer_cost_cents, t.project_id, COALESCE(sum(t.minutes), 0)::bigint AS minutes
+			FROM ${S}.pay_run_lines l LEFT JOIN ${S}.time_entries t ON t.pay_run_id = l.pay_run_id AND t.employee_id = l.employee_id
+			WHERE l.pay_run_id = $1 GROUP BY l.id, l.gross_cents, l.employer_cost_cents, t.project_id ORDER BY l.id, t.project_id NULLS FIRST`,
+			[id],
+		);
+		const byLine = new Map();
+		for (const r of rows) byLine.set(String(r.id), [...(byLine.get(String(r.id)) ?? []), r]);
+		const groups = new Map();
+		const add = (key, gross, employer) => {
+			const g = groups.get(key) ?? { gross: 0n, employer: 0n };
+			g.gross += gross;
+			g.employer += employer;
+			groups.set(key, g);
+		};
+		for (const parts of byLine.values()) {
+			const gross = BigInt(parts[0].gross_cents);
+			const employer = BigInt(parts[0].employer_cost_cents);
+			const total = parts.reduce((a, x) => a + BigInt(x.minutes), 0n);
+			if (total === 0n) {
+				add("", gross, employer);
+				continue;
+			}
+			let g = 0n;
+			let er = 0n;
+			parts.forEach((x, i) => {
+				const last = i === parts.length - 1;
+				const pg = last ? gross - g : (gross * BigInt(x.minutes)) / total;
+				const pe = last ? employer - er : (employer * BigInt(x.minutes)) / total;
+				g += pg;
+				er += pe;
+				add(x.project_id === null ? "" : String(x.project_id), pg, pe);
+			});
+		}
+		const ids = [...groups.keys()].filter(Boolean);
+		const projects = new Map((await q(`SELECT id, name, customer_entity_id FROM ${S}.projects WHERE id = ANY($1::bigint[])`, [ids])).rows.map((p) => [String(p.id), p]));
+		return [...groups]
+			.filter(([, g]) => g.gross + g.employer > 0n)
+			.map(([k, g]) => ({ ...g, project: k ? (projects.get(k) ?? null) : null }))
+			.sort((a, b) => (a.project?.name ?? "\uffff").localeCompare(b.project?.name ?? "\uffff"));
+	}
 
 	ctx.route("POST", "/pay-runs", async (req) => {
 		const b = body(req);
@@ -853,12 +873,37 @@ export default async function register(ctx) {
 
 		const claim = await q(`UPDATE ${S}.pay_runs SET status = 'posting' WHERE id = $1 AND status = 'draft'`, [id]);
 		if (claim.rowCount === 0) throw new ctx.HttpError(409, "Someone else is posting this pay run.");
-		const lines = [{ account_code: acc.wages_expense_account, debit_cents: run.gross_cents, memo: "Gross pay" }];
-		if (run.employer_cost_cents > 0n) lines.push({ account_code: acc.employer_cost_account, debit_cents: run.employer_cost_cents, memo: "Employer's share" });
-		if (withheld > 0n) lines.push({ account_code: acc.payroll_liabilities_account, credit_cents: withheld, memo: "Withheld from pay and employer's share, to remit" });
-		if (run.net_cents > 0n) lines.push({ account_code: paidFrom, credit_cents: run.net_cents, memo: "Net pay" });
+		// The costs, one entry per project (tagged with its customer and the project), go to the Wages payable
+		// clearing account; the pay run's own entry clears it to payroll liabilities and the account pay comes from.
+		const posted = [];
 		let entry;
 		try {
+			const wages = await wagesAccount(run.currency);
+			for (const g of await costGroups(id)) {
+				const what = g.project ? g.project.name : "no project";
+				const lines = [];
+				if (g.gross > 0n) lines.push({ account_code: acc.wages_expense_account, debit_cents: g.gross, memo: `Gross pay · ${what}`.slice(0, 500) });
+				if (g.employer > 0n) lines.push({ account_code: acc.employer_cost_account, debit_cents: g.employer, memo: `Employer's share · ${what}`.slice(0, 500) });
+				lines.push({ account_code: wages, credit_cents: g.gross + g.employer, memo: `Pay run ${id}` });
+				const customerId = g.project?.customer_entity_id ?? null;
+				const cost = await ctx.ledger.createJournalEntry(
+					{
+						entry_date: run.pay_date,
+						description: `Payroll ${run.period_start} to ${run.period_end} · ${what}`.slice(0, 500),
+						reference: `PAYRUN-${id}`,
+						...(customerId !== null ? { entity_id: Number(customerId) } : {}),
+						lines,
+						links: [{ ref: `payrun-cost:${id}`, label: `Pay run ${id} · ${what}`.slice(0, 200), href: `/apps/employees?payrun=${id}` }],
+					},
+					req.user,
+				);
+				posted.push(cost.id);
+				if (customerId !== null) await tagSafely(cost.id, "customer", { entity_id: Number(customerId) }, req.user);
+				if (g.project) await tagSafely(cost.id, "project", { note: g.project.name.slice(0, 200) }, req.user);
+			}
+			const lines = [{ account_code: wages, debit_cents: run.gross_cents + run.employer_cost_cents, memo: "Gross pay and employer's share" }];
+			if (withheld > 0n) lines.push({ account_code: acc.payroll_liabilities_account, credit_cents: withheld, memo: "Withheld from pay and employer's share, to remit" });
+			if (run.net_cents > 0n) lines.push({ account_code: paidFrom, credit_cents: run.net_cents, memo: "Net pay" });
 			entry = await ctx.ledger.createJournalEntry(
 				{
 					entry_date: run.pay_date,
@@ -870,6 +915,7 @@ export default async function register(ctx) {
 				req.user,
 			);
 		} catch (e) {
+			for (const p of posted) await reverseEntryOf(p, `Reversal: pay run ${id} (not posted)`, req.user).catch(() => {});
 			await q(`UPDATE ${S}.pay_runs SET status = 'draft' WHERE id = $1 AND status = 'posting'`, [id]);
 			throw e;
 		}
@@ -890,6 +936,7 @@ export default async function register(ctx) {
 		const run = await getRun(id);
 		if (run.status !== "posted") throw new ctx.HttpError(409, `This pay run is ${run.status}, not posted.`);
 		await reverseEntryOf(run.journal_entry_id, `Reversal: pay run ${id}`, req.user);
+		await reverseCosts(id, `Reversal: pay run ${id}`, req.user);
 		await q(`UPDATE ${S}.pay_runs SET status = 'reversed', reversed_by = $2, reversed_at = now() WHERE id = $1`, [id, req.user.username]);
 		await releaseRun(id);
 		pushSoon(req);
@@ -1037,6 +1084,15 @@ export default async function register(ctx) {
 		return serial(orgId, () => syncNow(settings, who));
 	}
 
+	/** Hours deleted in timesheet.io: gone here too, and out of the clearing account. */
+	async function dropPulled(id, who) {
+		const { rows } = await q(
+			`DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL AND billed_tag_entry_id IS NULL AND push_status = 'synced' RETURNING clearing_entry_id`,
+			[id],
+		);
+		if (rows.length) await unclear(rows[0].clearing_entry_id, `Reversal: billable hours of time entry ${id} (deleted in timesheet.io by ${who})`.slice(0, 500));
+	}
+
 	async function syncNow(settings, who) {
 		const key = checkKey(settings.timesheet_api_key);
 		const log = await q(`INSERT INTO ${S}.timesheet_syncs (started_by) VALUES ($1) RETURNING id`, [who]);
@@ -1050,7 +1106,7 @@ export default async function register(ctx) {
 			const known = new Map(); // timesheet task id → our entry
 			for (const r of (
 				await q(
-					`SELECT id, timesheet_task_id, timesheet_last_update_ms, work_date, push_status, (billing_id IS NOT NULL OR pay_run_id IS NOT NULL) AS locked
+					`SELECT id, timesheet_task_id, timesheet_last_update_ms, work_date, push_status, (billing_id IS NOT NULL OR pay_run_id IS NOT NULL OR billed_tag_entry_id IS NOT NULL) AS locked
 					FROM ${S}.time_entries WHERE timesheet_task_id IS NOT NULL`,
 				)
 			).rows)
@@ -1137,7 +1193,7 @@ export default async function register(ctx) {
 					if (!have) continue;
 					if (mine(have)) await keep(have); // made again in timesheet.io
 					else {
-						await q(`DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL AND push_status = 'synced'`, [have.id]);
+						await dropPulled(have.id, who);
 						n.removed++;
 					}
 					continue;
@@ -1151,13 +1207,13 @@ export default async function register(ctx) {
 				const projectId = await projectFor(t.project);
 				const r = await q(
 					`INSERT INTO ${S}.time_entries (employee_id, project_id, work_date, minutes, description, billable, source, timesheet_task_id, timesheet_last_update_ms,
-						timesheet_task_user_id, timesheet_start, timesheet_end, timesheet_break_seconds, push_status, created_by)
-					VALUES ($1, $2, $3, $4, $5, $6, 'timesheet', $7, $8, $9, $10, $11, $12, 'synced', $13)
+						timesheet_task_user_id, timesheet_start, timesheet_end, timesheet_break_seconds, push_status, clearing_status, created_by)
+					VALUES ($1, $2, $3, $4, $5, $6, 'timesheet', $7, $8, $9, $10, $11, $12, 'synced', 'pending', $13)
 					ON CONFLICT (timesheet_task_id) DO UPDATE SET employee_id = EXCLUDED.employee_id, project_id = EXCLUDED.project_id, work_date = EXCLUDED.work_date,
 						minutes = EXCLUDED.minutes, description = EXCLUDED.description, billable = EXCLUDED.billable,
 						timesheet_last_update_ms = EXCLUDED.timesheet_last_update_ms, timesheet_task_user_id = EXCLUDED.timesheet_task_user_id,
-						timesheet_start = EXCLUDED.timesheet_start, timesheet_end = EXCLUDED.timesheet_end, timesheet_break_seconds = EXCLUDED.timesheet_break_seconds, updated_at = now()
-					WHERE ${S}.time_entries.billing_id IS NULL AND ${S}.time_entries.pay_run_id IS NULL AND ${S}.time_entries.push_status = 'synced'
+						timesheet_start = EXCLUDED.timesheet_start, timesheet_end = EXCLUDED.timesheet_end, timesheet_break_seconds = EXCLUDED.timesheet_break_seconds, clearing_status = 'pending', updated_at = now()
+					WHERE ${S}.time_entries.billing_id IS NULL AND ${S}.time_entries.pay_run_id IS NULL AND ${S}.time_entries.billed_tag_entry_id IS NULL AND ${S}.time_entries.push_status = 'synced'
 					RETURNING (xmax = 0) AS inserted`,
 					[employeeId, projectId, t.work_date, t.minutes, t.description, t.billable, t.id, t.last_update_ms, t.user.id, t.start, t.end, t.break_seconds, who],
 				);
@@ -1174,7 +1230,7 @@ export default async function register(ctx) {
 					if (!seen.has(taskId) && have.work_date > since) {
 						if (mine(have)) await keep(have);
 						else {
-							await q(`DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL AND push_status = 'synced'`, [have.id]);
+							await dropPulled(have.id, who);
 							n.removed++;
 						}
 					}
@@ -1191,6 +1247,7 @@ export default async function register(ctx) {
 			if (!complete) parts.push("stopped at 10,000 entries: lower the days to pull");
 			const summary = `${parts.join("; ")}.`;
 			await finish(true, summary);
+			await postClearing(); // hours added or changed by the pull (already in this organization's queue)
 			await refreshTodos();
 			return { summary, ...n, ...out };
 		} catch (e) {
@@ -1360,7 +1417,7 @@ export default async function register(ctx) {
 		} catch {
 			return [];
 		}
-		if (entry.reverses_id !== null && entry.reverses_id !== undefined) return [];
+		if ((entry.reverses_id !== null && entry.reverses_id !== undefined) || (entry.reversed_by_id !== null && entry.reversed_by_id !== undefined)) return [];
 		return entry.links.filter((l) => l.module_id === ctx.id).map((l) => /^time:(\d{1,15})$/.exec(l.ref)?.[1]).filter(Boolean);
 	}
 
@@ -1370,6 +1427,7 @@ export default async function register(ctx) {
 			// Shown on the billing, read-only: the module doesn't take payments.
 			const paid = c.action === "set";
 			await q(`UPDATE ${S}.time_entries SET billing_paid = $2 WHERE billing_journal_entry_id = $1 AND billing_id IS NOT NULL AND billing_paid <> $2`, [entryId, paid]);
+			await q(`UPDATE ${S}.time_entries SET billing_paid = $2 WHERE clearing_entry_id = $1 AND billing_paid <> $2`, [entryId, paid]);
 			await q(`UPDATE ${S}.billings SET entry_paid = $2 WHERE journal_entry_id = $1 AND status = 'posted' AND entry_paid <> $2`, [entryId, paid]);
 			return;
 		}
@@ -1422,7 +1480,7 @@ export default async function register(ctx) {
 	//   0.23.0, or when tagging failed) get "billed" and their customer, and "paid" is read from them.
 	setTimeout(() => {
 		ctx.orgs
-			.forEach(async () => {
+			.forEach(async (org) => {
 				const { rows } = await q(`SELECT id, journal_entry_id, customer_entity_id, entry_tagged FROM ${S}.billings WHERE status = 'posted' AND journal_entry_id IS NOT NULL`);
 				for (const r of rows) {
 					try {
@@ -1434,6 +1492,19 @@ export default async function register(ctx) {
 						if (tags) await q(`UPDATE ${S}.billings SET entry_tagged = true, entry_paid = $2 WHERE id = $1`, [r.id, isPaid(tags)]);
 					} catch {
 						// the entry is gone (restored from elsewhere): nothing to tag
+					}
+				}
+				await serial(org.id, () => postClearing());
+				if (ctx.tags) {
+					// Tags set or taken off while the module wasn't running.
+					const { rows: live } = await q(`SELECT id, clearing_entry_id, billed_tag_entry_id, billing_paid FROM ${S}.time_entries WHERE clearing_status = 'posted' AND clearing_entry_id IS NOT NULL AND billing_id IS NULL ORDER BY id LIMIT 5000`);
+					for (const t of live) {
+						const tags = await ctx.tags.of(t.clearing_entry_id).catch(() => null);
+						if (!tags) continue;
+						const billed = tags.some((x) => x.tag === "billed" && x.module_id !== ctx.id);
+						const paid = tags.some((x) => x.tag === "paid");
+						if (billed !== (t.billed_tag_entry_id !== null) || paid !== t.billing_paid)
+							await q(`UPDATE ${S}.time_entries SET billed_tag_entry_id = $2, billing_paid = $3, push_status = 'pending' WHERE id = $1`, [t.id, billed ? t.clearing_entry_id : null, paid]);
 					}
 				}
 				if (!ctx.tags) return;
