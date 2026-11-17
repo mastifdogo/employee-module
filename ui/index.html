@@ -359,6 +359,7 @@
 			out.push(c);
 		} else if (t.in_timesheet) out.push(chip("timesheet.io"));
 		if (t.billing_id !== null) out.push(chip("billed", "ok"));
+		else if (t.billed_tag_entry_id !== null && t.billed_tag_entry_id !== undefined) out.push(taggedChip(t, "billed"));
 		else if (t.billable) out.push(chip("billable", "warn"));
 		if (t.pay_run_id !== null) out.push(chip("on pay run", "ok"));
 		return out;
@@ -468,6 +469,18 @@
 		setTimeout(() => URL.revokeObjectURL(url), 5000);
 	}
 
+	/** Hours not billed here whose transaction someone tagged Billed in Ledger (shared tags). */
+	const taggedChip = (t, text = "Billed by tag") => {
+		const c = chip(text, "ok");
+		c.title = `Transaction ${t.billed_tag_entry_id} was tagged Billed outside Employees (by another module or a person). Take the tag off there to bill these hours here.`;
+		return c;
+	};
+	/** What the shared tag Paid on a billing's transactions says ("paid", "partly paid"); set by Sales or a person. */
+	const paidChip = (text) => {
+		const c = chip(text, "ok");
+		c.title = "From the tag Paid on its transactions in Ledger. Employees only shows it.";
+		return c;
+	};
 	const journalLink = (id, text = `Entry ${id}`) => (id === null || id === undefined ? "" : h("a", { href: `/journal/${id}`, target: "_top" }, text));
 
 	async function openBilling(id) {
@@ -477,10 +490,10 @@
 			h(
 				"div",
 				{},
-				h("p", {}, `${b.period_start} to ${b.period_end}, billed ${b.billing_date}: ${hrs(b.total_minutes)} h, ${money(b.total_cents)} ${b.currency} `, chip(b.status, b.status === "posted" ? "ok" : "bad")),
+				h("p", {}, `${b.period_start} to ${b.period_end}, billed ${b.billing_date}: ${hrs(b.total_minutes)} h, ${money(b.total_cents)} ${b.currency} `, chip(b.status, b.status === "posted" ? "ok" : "bad"), b.paid ? " " : "", b.paid && paidChip(b.paid)),
 				b.journal_entry_id !== null && h("p", {}, journalLink(b.journal_entry_id, `Journal entry ${b.journal_entry_id}`), h("small", {}, " (one entry for this whole billing, made before each time entry had its own)")),
 				b.lines.length
-					? table(["Date", "Employee", "Project", "What", "#Hours", "#Rate", "#Amount", "Entry"], b.lines.map((t) => h("tr", {}, h("td", {}, t.work_date), h("td", {}, t.employee_name), h("td", {}, t.project_name ?? ""), h("td", {}, t.description), h("td", { class: "n" }, hrs(t.minutes)), h("td", { class: "n" }, money(t.rate_cents)), h("td", { class: "n" }, money(t.amount_cents)), h("td", {}, journalLink(t.billing_journal_entry_id)))))
+					? table(["Date", "Employee", "Project", "What", "#Hours", "#Rate", "#Amount", "Entry"], b.lines.map((t) => h("tr", {}, h("td", {}, t.work_date), h("td", {}, t.employee_name), h("td", {}, t.project_name ?? ""), h("td", {}, t.description), h("td", { class: "n" }, hrs(t.minutes)), h("td", { class: "n" }, money(t.rate_cents)), h("td", { class: "n" }, money(t.amount_cents)), h("td", { style: "white-space: nowrap" }, journalLink(t.billing_journal_entry_id), t.billing_paid ? " " : "", t.billing_paid && paidChip("paid")))))
 					: empty("Reversed: its hours are billable again."),
 				b.lines.length > 0 &&
 					h(
@@ -657,7 +670,7 @@
 			});
 
 		// Billed time entries
-		const unbillable = (t) => (t.billing_journal_entry_id === null ? "Billed before each time entry had its own transaction: reverse its whole billing below." : null);
+		const unbillable = (t) => (t.billing_id === null ? `Not billed here: transaction ${t.billed_tag_entry_id} is tagged Billed in Ledger. Take the tag off there to bill these hours here.` : t.billing_journal_entry_id === null ? "Billed before each time entry had its own transaction: reverse its whole billing below." : null);
 		const billedAll = edit && allBox(toUnbill, billed.filter((t) => !unbillable(t)).map((t) => t.id), redraw, "Choose all billed");
 		if (billedAll) boxes.push(billedAll);
 		const billedTable = billed.length
@@ -674,8 +687,8 @@
 							h("td", {}, t.description),
 							h("td", { class: "n" }, hrs(t.minutes)),
 							h("td", { class: "n" }, money(t.amount_cents)),
-							h("td", {}, chip("Billed", "ok")),
-							h("td", { style: "white-space: nowrap" }, journalLink(t.billing_journal_entry_id)),
+							h("td", { style: "white-space: nowrap" }, t.billing_id === null ? taggedChip(t) : chip("Billed", "ok"), t.billing_paid ? " " : "", t.billing_paid && paidChip("paid")),
+							h("td", { style: "white-space: nowrap" }, journalLink(t.billing_id === null ? t.billed_tag_entry_id : t.billing_journal_entry_id)),
 						),
 					),
 				)
@@ -706,7 +719,7 @@
 								h("td", { style: "white-space: nowrap" }, b.billing_date),
 								h("td", { class: "n" }, hrs(b.total_minutes)),
 								h("td", { class: "n" }, `${money(b.total_cents)} ${b.currency}`),
-								h("td", {}, chip(b.status, b.status === "posted" ? "ok" : b.status === "reversed" ? "bad" : "warn")),
+								h("td", { style: "white-space: nowrap" }, chip(b.status, b.status === "posted" ? "ok" : b.status === "reversed" ? "bad" : "warn"), b.paid ? " " : "", b.paid && paidChip(b.paid)),
 								h(
 									"td",
 									{ style: "white-space: nowrap" },

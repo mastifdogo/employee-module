@@ -3,8 +3,8 @@
 Track employee time, bill customers for billable hours and run payroll, with
 time pulled from [timesheet.io](https://timesheet.io) through its API.
 
-A module for [Ledger](https://github.com/mastifdogo/Bookeeping) (0.20.0 or
-newer). Install it under **Settings → Modules** by entering this repository's
+A module for [Ledger](https://github.com/mastifdogo/Bookeeping) (0.21.1 or
+newer; Ledger's shared tags, see *Tags* below, need 0.23.0). Install it under **Settings → Modules** by entering this repository's
 `owner/name`.
 
 ## What it does
@@ -18,7 +18,7 @@ newer). Install it under **Settings → Modules** by entering this repository's
   entries (one by one, a whole customer, or across customers) and press
   *Bill chosen*. **Each time entry posts its own transaction in the
   module's *Billable hours* clearing account**, with the customer on it and
-  tagged **Billed**. Nothing is posted to revenue: that happens when the hours
+  tagged **billed** and with the **customer** (Ledger's shared tags). Nothing is posted to revenue: that happens when the hours
   are invoiced. Sales picks them up as billable items (see *Invoicing billed
   hours* below). Billed time can be ticked
   and unbilled the same way, which reverses those transactions and makes the
@@ -84,9 +84,13 @@ module's tables:
   (`ctx.ledger.listJournalEntries({ accountCode })`) and take the debit lines
   on it;
 - the customer is the entry's `entity` (`{ id, name }`);
-- the entry carries the tag link `{ module_id: "employees", ref: "billed",
-  label: "Billed" }`, plus `{ ref: "time:<id>" }` naming the time entry
-  (label: date, person and hours; it opens the billing here);
+- the entry carries Ledger's shared tags `billed` and `customer` (the
+  customer's entity), so `ctx.tags.entries({ tag: "billed", entity_id })`
+  finds it (Ledger ≥ 0.23.0; see *Tags* below);
+- the link `{ ref: "time:<id>" }` names the time entry (label: date, person
+  and hours; it opens the billing here). The older mark, the link
+  `{ module_id: "employees", ref: "billed", label: "Billed" }`, is still set
+  as well for now, for Sales versions that look for it;
 - the reference is `HOURS-<time entry id>`; the debit line's memo is the
   item: `2026-11-12 · Ana Silva · 7.00 h × 120.00 · Website rebuild: Task t2`
   (the credit line's is "Offset: revenue only once invoiced").
@@ -96,9 +100,40 @@ accounts receivable too), and 0.6.0 to 0.8.0 to a *Billable hours* account the
 module made (usually 1250). Keep that account in Sales' billable costs until
 its hours are invoiced; unbilling one reverses it as usual.
 
-An unbilled entry is reversed (`reversed_by_id` is set) and loses its Billed
-tag. Billings made before 0.4.0 are one entry for the whole billing; they get
-the Billed tag too (when the module starts) and are linked as `billing:<id>`.
+An unbilled entry is reversed (`reversed_by_id` is set) and loses its tags
+(`billed`, `customer`) and its Billed link. Billings made before 0.4.0 are
+one entry for the whole billing; they get the tags and the Billed link too
+(when the module starts) and are linked as `billing:<id>`.
+
+## Tags
+
+Since 0.11.0 the module uses the tags on journal entries that Ledger 0.23.0
+shares between itself and every module. On an older Ledger it works as
+before, without them.
+
+- **What it sets.** When hours are billed, each time entry's transaction is
+  tagged `billed` (note: `Employees billing <id>`) and `customer` (the
+  project's customer). Unbilling a time entry or reversing a billing takes
+  both off again. Entries billed before 0.11.0, or on an older Ledger, are
+  tagged when the module next starts. Pay runs get no tag: a pay run's entry
+  already pays the net pay, there is no later payment to record, and it has no
+  customer or vendor.
+- **What it follows.** A tag belongs to the transaction, so Sales, another
+  module or a person (on the transaction's page) can set or remove it, and the
+  module's record follows. It never posts or reverses anything because of a
+  tag.
+  - `paid` on a billing's transaction: the billing shows *paid* (or *partly
+    paid* when only some of its transactions are). The module only shows it.
+  - `billed` set on a transaction the module posted for hours that aren't
+    billed here (one whose billing was reversed, say): those hours count as
+    billed (*Billed by tag* on the Billable hours tab, and billed in
+    timesheet.io) and aren't offered for billing until the tag is taken off.
+  - `billed` taken off a billing's transaction: its hours leave the billing
+    and are billable again (a billing with nothing left shows as reversed).
+    The transaction itself stays as it is; billing those hours here again
+    reverses it and posts a new one, and putting the tag back marks them
+    billed again. A billing from before 0.4.0 ignores this: reverse it
+    instead.
 
 ## timesheet.io
 
@@ -181,7 +216,7 @@ npm test    # nothing to install; needs a Ledger checkout and PostgreSQL, see te
 `test/run.sh` runs Ledger's module checker, serves the module in a real Ledger
 on a scratch database with `test/mock-timesheet.mjs` standing in for
 timesheet.io (`TIMESHEET_API_URL`), and runs `test/flow.mjs` through time,
-sync, billing and payroll.
+sync, billing, tags and payroll.
 
 ## Releasing
 

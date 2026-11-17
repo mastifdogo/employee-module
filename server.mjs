@@ -200,8 +200,10 @@ export default async function register(ctx) {
 	// ---- time entries -------------------------------------------------------
 	// What an hour of this entry is charged at: its own rate, else the project's, else the employee's.
 	const RATE = `COALESCE(t.bill_rate_cents, p.bill_rate_cents, e.bill_rate_cents, 0)`;
+	// Not billed: neither on a billing here nor tagged "billed" by someone else (shared tags, below).
+	const UNBILLED = `t.billing_id IS NULL AND t.billed_tag_entry_id IS NULL`;
 	const TIME = `t.id, t.employee_id, e.name AS employee_name, t.project_id, p.name AS project_name, p.customer_entity_id, t.work_date, t.minutes,
-		t.description, t.billable, t.bill_rate_cents, t.source, t.billing_id, t.pay_run_id, t.push_status, t.push_error, t.timesheet_task_id IS NOT NULL AS in_timesheet, t.billing_journal_entry_id,
+		t.description, t.billable, t.bill_rate_cents, t.source, t.billing_id, t.pay_run_id, t.push_status, t.push_error, t.timesheet_task_id IS NOT NULL AS in_timesheet, t.billing_journal_entry_id, t.billed_tag_entry_id, t.billing_paid,
 		COALESCE(t.billed_rate_cents, ${RATE}) AS rate_cents,
 		COALESCE(t.billed_amount_cents, round(t.minutes * ${RATE} / 60.0)::bigint) AS amount_cents
 		FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id LEFT JOIN ${S}.projects p ON p.id = t.project_id`;
@@ -217,9 +219,9 @@ export default async function register(ctx) {
 		if (g("from")) add("t.work_date >= ?", reqDate(g("from"), "from"));
 		if (g("to")) add("t.work_date <= ?", reqDate(g("to"), "to"));
 		if (g("employee_id")) add("t.employee_id = ?", idOf(g("employee_id"), "employee"));
-		if (g("show") === "billable") where.push("t.billable AND t.billing_id IS NULL");
+		if (g("show") === "billable") where.push(`t.billable AND ${UNBILLED}`);
 		if (g("show") === "unpaid") where.push("t.pay_run_id IS NULL");
-		if (g("show") === "billed") where.push("t.billing_id IS NOT NULL");
+		if (g("show") === "billed") where.push("(t.billing_id IS NOT NULL OR t.billed_tag_entry_id IS NOT NULL)");
 		const { rows } = await q(`SELECT ${TIME} ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY t.work_date DESC, t.id DESC LIMIT 1000`, params);
 		return { data: rows };
 	});
@@ -336,9 +338,44 @@ export default async function register(ctx) {
 	// account: a debit (the item, details in its memo) and a credit of the same amount, with the
 	// customer as the entry's entity. Nothing reaches revenue until the hours are invoiced. An invoicing
 	// module picks the debits up as the customer's billable items (Sales: Settings → Sales → Accounts →
-	// Billable costs); it also finds them by the link with ref "billed" (label "Billed").
+	// Billable costs). Each entry carries Ledger's shared tags "billed" and "customer" (Ledger ≥ 0.23.0,
+	// see "shared tags" below).
+	// The older mark, an entry link with ref "billed" (label "Billed"), is kept for now as well: Sales
+	// on older versions still looks for that link. It can go once nothing reads it.
 	const BILLED_TAG = { ref: "billed", label: "Billed" };
-	const BILL = `id, customer_entity_id, customer_name, period_start, period_end, billing_date, currency, total_minutes, total_cents, status, journal_entry_id, created_by, created_at, reversed_by, reversed_at`;
+	// paid: what the shared tag "paid" on its journal entries says ("paid", "partly paid" or null); read-only here.
+	const BILL = `id, customer_entity_id, customer_name, period_start, period_end, billing_date, currency, total_minutes, total_cents, status, journal_entry_id, created_by, created_at, reversed_by, reversed_at,
+		CASE WHEN status <> 'posted' THEN NULL WHEN entry_paid THEN 'paid'
+			ELSE (SELECT CASE WHEN count(*) FILTER (WHERE x.billing_paid) = 0 THEN NULL WHEN bool_and(x.billing_paid) THEN 'paid' ELSE 'partly paid' END
+				FROM ${S}.time_entries x WHERE x.billing_id = billings.id) END AS paid`;
+
+	// ---- shared tags (Ledger ≥ 0.23.0; on an older Ledger ctx.tags is missing and these do nothing) ----
+	const tagWarn = (what, entryId, e) => ctx.log.warn(`could not ${what} journal entry ${entryId}`, { error: String(e?.message ?? e) });
+	/** Tags a billing's journal entry "billed" and with its customer. → the entry's tags, or null when "billed" isn't on it. */
+	async function tagBilled(entryId, customerId, billingId, user, quiet = false) {
+		if (!ctx.tags) return null;
+		let tags;
+		try {
+			tags = await ctx.tags.set(entryId, "billed", { note: `Employees billing ${billingId}` }, user);
+		} catch (e) {
+			if (!quiet) tagWarn("tag", entryId, e);
+			return null; // tried again when the module next starts
+		}
+		// Who it is with. Refused when the entity is no longer a customer: the entry's own entity still says who.
+		if (customerId !== null && customerId !== undefined) await ctx.tags.set(entryId, "customer", { entity_id: Number(customerId) }, user).catch((e) => quiet || tagWarn("tag the customer on", entryId, e));
+		return tags;
+	}
+	/** Takes "billed" and the customer off an entry that is no longer a billing's. */
+	async function untagBilled(entryId, customerId) {
+		if (!ctx.tags) return;
+		try {
+			await ctx.tags.remove(entryId, "billed");
+			if (customerId !== null && customerId !== undefined) await ctx.tags.remove(entryId, "customer", { entity_id: Number(customerId) });
+		} catch (e) {
+			tagWarn("untag", entryId, e);
+		}
+	}
+	const isPaid = (tags) => tags.some((t) => t.tag === "paid");
 	const idList = (v, name) => {
 		if (!Array.isArray(v) || v.length === 0) throw bad(`choose at least one ${name}`);
 		if (v.length > 2000) throw bad(`choose at most 2000 ${name}s at a time`);
@@ -349,7 +386,7 @@ export default async function register(ctx) {
 	/** Frees time entries from their billing: they are billable again (and timesheet.io is told). */
 	const unclaim = (ids) =>
 		q(
-			`UPDATE ${S}.time_entries SET billing_id = NULL, billed_rate_cents = NULL, billed_amount_cents = NULL, billing_journal_entry_id = NULL,
+			`UPDATE ${S}.time_entries SET billing_id = NULL, billed_rate_cents = NULL, billed_amount_cents = NULL, billing_journal_entry_id = NULL, billing_tagged = false, billing_paid = false,
 				push_status = 'pending', push_error = '', updated_at = now()
 			WHERE id = ANY($1::bigint[])`,
 			[ids],
@@ -406,7 +443,7 @@ export default async function register(ctx) {
 	 */
 	async function billEntries(ids, { billingDate, acc, currency, user }) {
 		const { rows } = await q(
-			`SELECT t.id, t.work_date, t.minutes, t.description, t.billable, t.billing_id, e.name AS employee_name, p.name AS project_name, p.customer_entity_id,
+			`SELECT t.id, t.work_date, t.minutes, t.description, t.billable, t.billing_id, t.billed_tag_entry_id, t.billing_journal_entry_id AS leftover_entry_id, e.name AS employee_name, p.name AS project_name, p.customer_entity_id,
 				${RATE} AS rate, round(t.minutes * ${RATE} / 60.0)::bigint AS amount
 			FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id LEFT JOIN ${S}.projects p ON p.id = t.project_id
 			WHERE t.id = ANY($1::bigint[]) ORDER BY t.work_date, t.id`,
@@ -419,6 +456,7 @@ export default async function register(ctx) {
 		for (const r of rows) {
 			const reason =
 				r.billing_id !== null ? "already billed"
+				: r.billed_tag_entry_id !== null ? `tagged Billed on transaction ${r.billed_tag_entry_id} outside Employees`
 				: !r.billable ? "not billable"
 				: r.customer_entity_id === null ? (r.project_name ? `the project ${r.project_name} has no customer` : "no project, so no customer")
 				: r.rate <= 0n ? "no billing rate"
@@ -458,12 +496,12 @@ export default async function register(ctx) {
 			// Claimed in one statement, so a second batch can't bill the same time twice.
 			const { rows: claimed } = await q(
 				`UPDATE ${S}.time_entries t
-				SET billing_id = $2, billed_rate_cents = r.rate, billed_amount_cents = round(t.minutes * r.rate / 60.0)::bigint, push_status = 'pending', push_error = '', updated_at = now()
+				SET billing_id = $2, billed_rate_cents = r.rate, billed_amount_cents = round(t.minutes * r.rate / 60.0)::bigint, billing_journal_entry_id = NULL, push_status = 'pending', push_error = '', updated_at = now()
 				FROM ${S}.time_entries t2
 				JOIN ${S}.employees e ON e.id = t2.employee_id
 				JOIN ${S}.projects p ON p.id = t2.project_id
 				CROSS JOIN LATERAL (SELECT COALESCE(t2.bill_rate_cents, p.bill_rate_cents, e.bill_rate_cents, 0) AS rate) r
-				WHERE t2.id = t.id AND t.id = ANY($1::bigint[]) AND p.customer_entity_id = $3 AND t.billable AND t.billing_id IS NULL AND r.rate > 0
+				WHERE t2.id = t.id AND t.id = ANY($1::bigint[]) AND p.customer_entity_id = $3 AND t.billable AND ${UNBILLED} AND r.rate > 0
 				RETURNING t.id, t.minutes, t.billed_amount_cents AS amount`,
 				[list.map((r) => r.id), billingId, entity.id],
 			);
@@ -474,6 +512,9 @@ export default async function register(ctx) {
 				const c = claimed[i];
 				const t = info.get(String(c.id));
 				try {
+					// An entry left from when someone took the tag "billed" off it (the hours became billable
+					// again, see the tag listener): billing again replaces it, as unbilling would have.
+					if (t.leftover_entry_id !== null) await reverseEntryOf(t.leftover_entry_id, `Reversal: billable hours (time entry ${c.id}), billed again`, user);
 					const entry = await ctx.ledger.createJournalEntry(
 						{
 							entry_date: billingDate,
@@ -495,6 +536,8 @@ export default async function register(ctx) {
 					);
 					await q(`UPDATE ${S}.time_entries SET billing_journal_entry_id = $2 WHERE id = $1`, [c.id, entry.id]);
 					posted.push(c);
+					// The shared tags: billed, and who it is with. A failure never undoes the billing; it is tagged at the next start.
+					if (await tagBilled(entry.id, entity.id, billingId, user)) await q(`UPDATE ${S}.time_entries SET billing_tagged = true WHERE id = $1`, [c.id]);
 				} catch (e) {
 					// Stop here (the same accounts would fail again); the rest become billable again.
 					failure = e;
@@ -572,7 +615,7 @@ export default async function register(ctx) {
 		const setup = await billingSetup(b);
 		const { rows } = await q(
 			`SELECT t.id FROM ${S}.time_entries t JOIN ${S}.projects p ON p.id = t.project_id
-			WHERE p.customer_entity_id = $1 AND t.billable AND t.billing_id IS NULL AND t.work_date BETWEEN $2 AND $3`,
+			WHERE p.customer_entity_id = $1 AND t.billable AND ${UNBILLED} AND t.work_date BETWEEN $2 AND $3`,
 			[entity.id, from, to],
 		);
 		if (rows.length === 0) throw bad(`${entity.name} has no unbilled billable hours from ${from} to ${to}.`);
@@ -620,14 +663,17 @@ export default async function register(ctx) {
 		if (entry.reversed_by_id === null) await ctx.ledger.reverseJournalEntry(entryId, { description }, user);
 	}
 
-	/** Reverses billed time entries' own journal entries and drops their Billed tag; the time is billable again. */
+	/** Reverses billed time entries' own journal entries and drops their tags (billed, customer) and Billed link; the time is billable again. */
 	async function unbill(rows, user) {
 		const billingIds = new Set();
 		const done = [];
+		const { rows: of } = await q(`SELECT id, customer_entity_id FROM ${S}.billings WHERE id = ANY($1::bigint[])`, [[...new Set(rows.map((r) => r.billing_id))]]);
+		const customerOf = new Map(of.map((b) => [String(b.id), b.customer_entity_id]));
 		for (const r of rows) {
 			if (r.billing_journal_entry_id !== null) {
 				await reverseEntryOf(r.billing_journal_entry_id, `Reversal: billable hours (time entry ${r.id})`, user);
 				await ctx.ledger.unlinkJournalEntry(r.billing_journal_entry_id, BILLED_TAG.ref).catch(() => false);
+				await untagBilled(r.billing_journal_entry_id, customerOf.get(String(r.billing_id)));
 			}
 			done.push(r.id);
 			billingIds.add(String(r.billing_id));
@@ -653,7 +699,7 @@ export default async function register(ctx) {
 		const { rows } = await q(`SELECT status, customer_name FROM ${S}.billings WHERE id = $1`, [id]);
 		if (rows.length === 0) throw new ctx.HttpError(404, "no such billing");
 		for (const t of (await q(`SELECT id FROM ${S}.time_entries WHERE billing_id = $1`, [id])).rows)
-			await ctx.root.update(req, "time_entries", t.id, { billing_id: null, billed_rate_cents: null, billed_amount_cents: null, billing_journal_entry_id: null });
+			await ctx.root.update(req, "time_entries", t.id, { billing_id: null, billed_rate_cents: null, billed_amount_cents: null, billing_journal_entry_id: null, billing_tagged: false, billing_paid: false });
 		return ctx.root.remove(req, "billings", id, `Employees: deleted ${rows[0].status} billing ${id} · ${rows[0].customer_name}`);
 	});
 
@@ -664,10 +710,13 @@ export default async function register(ctx) {
 		if (rows[0].status !== "posted") throw new ctx.HttpError(409, `This billing is ${rows[0].status}, not posted.`);
 		// A billing from before 0.4.0 has one journal entry for all its time.
 		await reverseEntryOf(rows[0].journal_entry_id, `Reversal: billed hours ${id} · ${rows[0].customer_name}`, req.user);
-		if (rows[0].journal_entry_id !== null) await ctx.ledger.unlinkJournalEntry(rows[0].journal_entry_id, BILLED_TAG.ref).catch(() => false);
+		if (rows[0].journal_entry_id !== null) {
+			await ctx.ledger.unlinkJournalEntry(rows[0].journal_entry_id, BILLED_TAG.ref).catch(() => false);
+			await untagBilled(rows[0].journal_entry_id, rows[0].customer_entity_id);
+		}
 		const { rows: entries } = await q(`SELECT id, billing_id, billing_journal_entry_id FROM ${S}.time_entries WHERE billing_id = $1`, [id]);
 		await unbill(entries, req.user);
-		await q(`UPDATE ${S}.billings SET status = 'reversed', reversed_by = COALESCE(reversed_by, $2), reversed_at = COALESCE(reversed_at, now()) WHERE id = $1`, [id, req.user.username]);
+		await q(`UPDATE ${S}.billings SET status = 'reversed', entry_tagged = false, entry_paid = false, reversed_by = COALESCE(reversed_by, $2), reversed_at = COALESCE(reversed_at, now()) WHERE id = $1`, [id, req.user.username]);
 		pushSoon(req);
 		return { id: rows[0].id, status: "reversed" };
 	});
@@ -918,7 +967,7 @@ export default async function register(ctx) {
 			`SELECT t.id, t.work_date, t.minutes, t.description, t.billable, t.updated_at::text AS updated_stamp, t.timesheet_task_id, t.timesheet_task_user_id,
 				t.timesheet_start, t.timesheet_end, t.timesheet_break_seconds,
 				e.name AS employee_name, e.timesheet_user_id, p.name AS project_name, p.timesheet_project_id,
-				(t.billing_id IS NOT NULL) AS billed, COALESCE(r.status = 'posted', false) AS paid
+				(t.billing_id IS NOT NULL OR t.billed_tag_entry_id IS NOT NULL) AS billed, COALESCE(r.status = 'posted', false) AS paid
 			FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id
 			LEFT JOIN ${S}.projects p ON p.id = t.project_id LEFT JOIN ${S}.pay_runs r ON r.id = t.pay_run_id
 			WHERE t.push_status IN ('pending', 'failed')
@@ -1194,9 +1243,9 @@ export default async function register(ctx) {
 			`SELECT
 				(SELECT count(*)::int FROM ${S}.employees WHERE is_active) AS employees,
 				(SELECT COALESCE(sum(t.minutes), 0)::int FROM ${S}.time_entries t WHERE t.pay_run_id IS NULL) AS unpaid_minutes,
-				(SELECT COALESCE(sum(t.minutes), 0)::int FROM ${S}.time_entries t WHERE t.billable AND t.billing_id IS NULL) AS unbilled_minutes,
+				(SELECT COALESCE(sum(t.minutes), 0)::int FROM ${S}.time_entries t WHERE t.billable AND ${UNBILLED}) AS unbilled_minutes,
 				(SELECT COALESCE(sum(round(t.minutes * ${RATE} / 60.0)), 0)::bigint FROM ${S}.time_entries t JOIN ${S}.employees e ON e.id = t.employee_id
-					LEFT JOIN ${S}.projects p ON p.id = t.project_id WHERE t.billable AND t.billing_id IS NULL) AS unbilled_cents`,
+					LEFT JOIN ${S}.projects p ON p.id = t.project_id WHERE t.billable AND ${UNBILLED}) AS unbilled_cents`,
 		);
 		return {
 			...rows[0],
@@ -1214,7 +1263,7 @@ export default async function register(ctx) {
 			const { rows } = await q(
 				`SELECT (SELECT count(*)::int FROM ${S}.employees WHERE is_active AND pay_rate_cents = 0) AS no_rate,
 					(SELECT count(DISTINCT p.id)::int FROM ${S}.projects p JOIN ${S}.time_entries t ON t.project_id = p.id
-						WHERE p.customer_entity_id IS NULL AND t.billable AND t.billing_id IS NULL) AS no_customer`,
+						WHERE p.customer_entity_id IS NULL AND t.billable AND ${UNBILLED}) AS no_customer`,
 			);
 			const todo = async (key, count, title) => {
 				if (count > 0) {
@@ -1300,23 +1349,107 @@ export default async function register(ctx) {
 			})
 			.catch((e) => ctx.log.warn("timesheet.io sync failed", { error: String(e?.message ?? e) }));
 
-	// Billings made before 0.4.0 have one journal entry for the whole billing: tag it Billed too, so other
-	// modules find all billed hours the same way (the same ref again only updates the link).
+	// ---- shared tags: what others say about the module's entries -----------------------------
+	// A tag belongs to the entry: another module (Sales, when it invoices or is paid) or a person can
+	// set or remove it. The module's record follows the tag; nothing is ever posted because of one.
+	/** The time entries a journal entry was posted for (its links "time:<id>" from this module); none for a reversal. */
+	async function timeEntriesOf(entryId) {
+		let entry;
+		try {
+			entry = await ctx.ledger.getJournalEntry(entryId);
+		} catch {
+			return [];
+		}
+		if (entry.reverses_id !== null && entry.reverses_id !== undefined) return [];
+		return entry.links.filter((l) => l.module_id === ctx.id).map((l) => /^time:(\d{1,15})$/.exec(l.ref)?.[1]).filter(Boolean);
+	}
+
+	async function onTagChange(c) {
+		const entryId = c.entry_id;
+		if (c.tag === "paid") {
+			// Shown on the billing, read-only: the module doesn't take payments.
+			const paid = c.action === "set";
+			await q(`UPDATE ${S}.time_entries SET billing_paid = $2 WHERE billing_journal_entry_id = $1 AND billing_id IS NOT NULL AND billing_paid <> $2`, [entryId, paid]);
+			await q(`UPDATE ${S}.billings SET entry_paid = $2 WHERE journal_entry_id = $1 AND status = 'posted' AND entry_paid <> $2`, [entryId, paid]);
+			return;
+		}
+		if (c.tag !== "billed") return;
+		if (c.action === "set") {
+			// On a billing's own entry it only confirms what the module has.
+			const own = await q(`UPDATE ${S}.time_entries SET billing_tagged = true WHERE billing_journal_entry_id = $1 AND billing_id IS NOT NULL`, [entryId]);
+			const old = await q(`UPDATE ${S}.billings SET entry_tagged = true WHERE journal_entry_id = $1 AND status = 'posted'`, [entryId]);
+			if (own.rowCount || old.rowCount) return;
+			// On an entry this module posted for hours that aren't billed here: they are billed, so not offered again.
+			const ids = await timeEntriesOf(entryId);
+			if (ids.length)
+				await q(
+					`UPDATE ${S}.time_entries SET billed_tag_entry_id = $1, push_status = 'pending', push_error = '', updated_at = now()
+					WHERE id = ANY($2::bigint[]) AND billing_id IS NULL AND billed_tag_entry_id IS NULL`,
+					[entryId, ids],
+				);
+			return;
+		}
+		// "billed" taken off: hours someone else had marked billed are billable again...
+		await q(`UPDATE ${S}.time_entries SET billed_tag_entry_id = NULL, push_status = 'pending', push_error = '', updated_at = now() WHERE billed_tag_entry_id = $1`, [entryId]);
+		// ...and so are hours billed here. Their journal entry is not reversed (nothing is posted for a
+		// tag); it stays on the time entry (billing_journal_entry_id) and is reversed if the hours are
+		// billed here again, or the hours are billed once more when someone puts the tag back.
+		const { rows } = await q(`SELECT id, billing_id FROM ${S}.time_entries WHERE billing_journal_entry_id = $1 AND billing_id IS NOT NULL`, [entryId]);
+		if (rows.length === 0) return; // (a billing from before 0.4.0 keeps its hours: its one entry covers them all)
+		await q(
+			`UPDATE ${S}.time_entries SET billing_id = NULL, billed_rate_cents = NULL, billed_amount_cents = NULL, billing_tagged = false, billing_paid = false,
+				push_status = 'pending', push_error = '', updated_at = now()
+			WHERE id = ANY($1::bigint[])`,
+			[rows.map((r) => r.id)],
+		);
+		await ctx.ledger.unlinkJournalEntry(entryId, BILLED_TAG.ref).catch(() => false); // the older mark says the same
+		for (const id of new Set(rows.map((r) => String(r.billing_id)))) await retotal(id, 'tag "billed" removed');
+	}
+	if (ctx.tags)
+		ctx.tags.onChange(async (c) => {
+			if (c.module_id === ctx.id) return; // the module's own changes are already in its tables
+			try {
+				await onTagChange(c);
+			} catch (e) {
+				ctx.log.warn("could not follow a tag change", { entry: c.entry_id, tag: c.tag, error: String(e?.message ?? e) });
+			}
+		});
+
+	// Once at startup, in every organization (each step skips what is already done):
+	// - billings made before 0.4.0 have one journal entry for the whole billing: it gets the Billed link
+	//   too, so older modules find all billed hours the same way (the same ref again only updates the link);
+	// - billed entries that don't carry the shared tags yet (billed before 0.11.0, on a Ledger before
+	//   0.23.0, or when tagging failed) get "billed" and their customer, and "paid" is read from them.
 	setTimeout(() => {
 		ctx.orgs
 			.forEach(async () => {
-				const { rows } = await q(`SELECT id, journal_entry_id FROM ${S}.billings WHERE status = 'posted' AND journal_entry_id IS NOT NULL`);
+				const { rows } = await q(`SELECT id, journal_entry_id, customer_entity_id, entry_tagged FROM ${S}.billings WHERE status = 'posted' AND journal_entry_id IS NOT NULL`);
 				for (const r of rows) {
 					try {
 						const entry = await ctx.ledger.getJournalEntry(r.journal_entry_id);
-						if (entry.reversed_by_id === null && !entry.links.some((l) => l.module_id === ctx.id && l.ref === BILLED_TAG.ref))
-							await ctx.ledger.linkJournalEntry(r.journal_entry_id, { ...BILLED_TAG, href: billingHref(r.id) });
+						if (entry.reversed_by_id !== null) continue;
+						if (!entry.links.some((l) => l.module_id === ctx.id && l.ref === BILLED_TAG.ref)) await ctx.ledger.linkJournalEntry(r.journal_entry_id, { ...BILLED_TAG, href: billingHref(r.id) });
+						if (r.entry_tagged) continue;
+						const tags = await tagBilled(r.journal_entry_id, r.customer_entity_id, r.id, undefined, true);
+						if (tags) await q(`UPDATE ${S}.billings SET entry_tagged = true, entry_paid = $2 WHERE id = $1`, [r.id, isPaid(tags)]);
 					} catch {
 						// the entry is gone (restored from elsewhere): nothing to tag
 					}
 				}
+				if (!ctx.tags) return;
+				const { rows: untagged } = await q(
+					`SELECT t.id, t.billing_id, t.billing_journal_entry_id, b.customer_entity_id FROM ${S}.time_entries t JOIN ${S}.billings b ON b.id = t.billing_id
+					WHERE b.status = 'posted' AND t.billing_journal_entry_id IS NOT NULL AND NOT t.billing_tagged ORDER BY t.id`,
+				);
+				let missed = 0;
+				for (const t of untagged) {
+					const tags = await tagBilled(t.billing_journal_entry_id, t.customer_entity_id, t.billing_id, undefined, true);
+					if (tags) await q(`UPDATE ${S}.time_entries SET billing_tagged = true, billing_paid = $2 WHERE id = $1 AND billing_journal_entry_id = $3`, [t.id, isPaid(tags), t.billing_journal_entry_id]);
+					else missed++;
+				}
+				if (untagged.length) ctx.log.info("billed entries tagged", { tagged: untagged.length - missed, not_tagged: missed });
 			})
-			.catch((e) => ctx.log.warn("could not tag older billings", { error: String(e?.message ?? e) }));
+			.catch((e) => ctx.log.warn("could not tag billed entries", { error: String(e?.message ?? e) }));
 	}, 5_000).unref();
 
 	// Records that can't work, which keep root mode from being left.
