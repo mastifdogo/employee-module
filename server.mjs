@@ -348,16 +348,23 @@ export default async function register(ctx) {
 			return ctx.root.remove(req, "time_entries", id, `Employees: deleted ${hours(rows[0].minutes)} h of ${rows[0].name} on ${rows[0].work_date} (time entry ${id})`);
 		}
 		const entry = await openEntry(id);
+		// Its billable hours leave the clearing account (and so Sales' billable items) before the entry goes.
 		// Its task in timesheet.io is deleted too (queued, so a failed call is retried).
-		const { rows: gone } = await q(
-			`WITH gone AS (DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL AND billed_tag_entry_id IS NULL RETURNING timesheet_task_id, clearing_entry_id),
-			queued AS (INSERT INTO ${S}.timesheet_deletions (task_id, requested_by) SELECT timesheet_task_id, $2 FROM gone WHERE timesheet_task_id IS NOT NULL ON CONFLICT (task_id) DO NOTHING)
-			SELECT timesheet_task_id, clearing_entry_id FROM gone`,
-			[id, req.user.username],
+		const gone = await reverseThenDelete(id, entry.clearing_entry_id, `Reversal: billable hours of time entry ${id} (deleted)`, req.user, async () =>
+			(
+				await q(
+					`WITH gone AS (DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL AND billed_tag_entry_id IS NULL RETURNING timesheet_task_id, clearing_entry_id),
+					queued AS (INSERT INTO ${S}.timesheet_deletions (task_id, requested_by) SELECT timesheet_task_id, $2 FROM gone WHERE timesheet_task_id IS NOT NULL ON CONFLICT (task_id) DO NOTHING)
+					SELECT timesheet_task_id, clearing_entry_id FROM gone`,
+					[id, req.user.username],
+				)
+			).rows,
 		);
-		if (gone.length === 0) throw new ctx.HttpError(409, "This time entry was just billed or paid.");
-		// Its billable hours leave the clearing account (and so Sales' billable items).
-		await unclear(gone[0].clearing_entry_id, `Reversal: billable hours of time entry ${id} (deleted)`, req.user);
+		if (gone === null) throw new ctx.HttpError(409, "This time is billed: its transaction is tagged Billed (an invoice bills it). Void that invoice to change it.");
+		if (gone.length === 0) {
+			await clearingFor(req); // it stays, so its billable hours go back to the clearing account
+			throw new ctx.HttpError(409, "This time entry was just billed or paid.");
+		}
 		if (entry.timesheet_task_id) pushSoon(req);
 	});
 
@@ -401,6 +408,20 @@ export default async function register(ctx) {
 		await reverseEntryOf(entryId, description, user);
 		// The tags this module put on it (customer, employee, project, the employee's name); others' stay.
 		if (ctx.tags) for (const t of await ctx.tags.of(entryId).catch(() => [])) if (t.module_id === ctx.id) await ctx.tags.remove(entryId, t.tag).catch(() => {});
+	}
+	/**
+	 * Deletes a time entry, its clearing transaction first: if the reversal fails nothing has changed,
+	 * where deleting first left the billable item in the clearing account with no hours behind it.
+	 * del() deletes the row if it is still open and returns what it deleted.
+	 * → those rows; [] when the entry was billed, paid or changed meanwhile (it stays and its billable
+	 * hours are posted again); null when its transaction was tagged "billed" a moment ago (nothing done).
+	 */
+	async function reverseThenDelete(id, clearingEntryId, description, user, del) {
+		if (clearingEntryId !== null && ctx.tags && (await ctx.tags.of(clearingEntryId).catch(() => [])).some((x) => x.tag === "billed")) return null;
+		await unclear(clearingEntryId, description, user);
+		const rows = await del();
+		if (rows.length === 0 && clearingEntryId !== null) await q(`UPDATE ${S}.time_entries SET clearing_status = 'pending' WHERE id = $1 AND clearing_entry_id = $2`, [id, clearingEntryId]);
+		return rows;
 	}
 	/** The employee's name as a tag: Ledger's tags are lowercase words ("Ana Silva" → "ana-silva"). */
 	const RESERVED_TAGS = new Set(["paid", "billed", "overdue", "customer", "vendor", "employee", "project"]);
@@ -573,13 +594,27 @@ export default async function register(ctx) {
 			[billingId, who],
 		);
 
-	/** A posting the server didn't finish (it stopped half-way): keep it if its entry exists, else undo it. */
-	async function settle(table, prefix, undo) {
-		const { rows } = await q(`SELECT id FROM ${S}.${table} WHERE status = 'posting' AND created_at < now() - interval '2 minutes'`);
+	// Changing the books is for bookkeepers and admins: a viewer's GET never settles (or reverses) anything.
+	const canWrite = (req) => req.user.role === "admin" || req.user.role === "bookkeeper";
+
+	/**
+	 * A pay run whose posting the server didn't finish (it stopped half-way): what it put in the books
+	 * is reversed and it is a draft again, to be posted once more.
+	 * Not finished = claimed for posting over 2 minutes ago (posting_at; a run from before that column
+	 * has none, so when it was made). When the draft was made says nothing: a run made yesterday may
+	 * be posting right now, its cost entries in the books and its own entry, posted last, not yet.
+	 */
+	async function settlePayRuns(user) {
+		const { rows } = await q(`SELECT id, posting_at::text AS claim FROM ${S}.pay_runs WHERE status = 'posting' AND COALESCE(posting_at, created_at) < now() - interval '2 minutes'`);
 		for (const r of rows) {
-			const linked = (await ctx.ledger.linkedEntries(`${prefix}:${r.id}`)).find((l) => !l.reversed);
-			if (linked) await q(`UPDATE ${S}.${table} SET status = 'posted', journal_entry_id = $2 WHERE id = $1 AND status = 'posting'`, [r.id, linked.entry_id]);
-			else await undo(r.id);
+			// Take the run over from that posting first (a new posting_at). If it is still running after all,
+			// it finds the run is no longer its own, reverses what it posted and never marks the run posted;
+			// nobody can post the run again while its entries are reversed here; and of two requests
+			// settling at once, one does it.
+			const mine = await q(`UPDATE ${S}.pay_runs SET posting_at = clock_timestamp() WHERE id = $1 AND status = 'posting' AND posting_at IS NOT DISTINCT FROM $2::timestamptz RETURNING posting_at::text AS claim`, [r.id, r.claim]);
+			if (mine.rows.length === 0) continue;
+			await undoPayRunEntries(r.id, user);
+			await q(`UPDATE ${S}.pay_runs SET status = 'draft', posting_at = NULL WHERE id = $1 AND status = 'posting' AND posting_at = $2::timestamptz`, [r.id, mine.rows[0].claim]);
 		}
 	}
 
@@ -603,8 +638,8 @@ export default async function register(ctx) {
 		}
 	}
 
-	ctx.route("GET", "/billings", async () => {
-		await settleBillings();
+	ctx.route("GET", "/billings", async (req) => {
+		if (canWrite(req)) await settleBillings();
 		const { rows } = await q(`SELECT ${BILL} FROM ${S}.billings ORDER BY id DESC LIMIT 200`);
 		return { data: rows };
 	});
@@ -626,7 +661,14 @@ export default async function register(ctx) {
 		} catch {
 			return; // the books have no such entry (restored from elsewhere): nothing to reverse
 		}
-		if (entry.reversed_by_id === null) await ctx.ledger.reverseJournalEntry(entryId, { description }, user);
+		if (entry.reversed_by_id !== null) return;
+		try {
+			await ctx.ledger.reverseJournalEntry(entryId, { description }, user);
+		} catch (e) {
+			// Reversed by someone else in between (a posting given up on is undone from both sides): done.
+			const now = await ctx.ledger.getJournalEntry(entryId).catch(() => null);
+			if (!now || now.reversed_by_id === null) throw e;
+		}
 	}
 
 	/** Reverses billed time entries' own journal entries and drops their tags (billed, customer) and Billed link; the time is billable again. */
@@ -697,11 +739,8 @@ export default async function register(ctx) {
 		return { ...rows[0], lines: lines.rows };
 	}
 
-	ctx.route("GET", "/pay-runs", async () => {
-		await settle("pay_runs", "payrun", async (id) => {
-			await reverseCosts(id, `Reversal: pay run ${id} (not posted)`);
-			await q(`UPDATE ${S}.pay_runs SET status = 'draft' WHERE id = $1 AND status = 'posting'`, [id]);
-		});
+	ctx.route("GET", "/pay-runs", async (req) => {
+		if (canWrite(req)) await settlePayRuns(req.user);
 		const { rows } = await q(`SELECT ${RUN}, ${RUN_TOTALS} FROM ${S}.pay_runs r ORDER BY r.id DESC LIMIT 200`);
 		return { data: rows };
 	});
@@ -728,6 +767,12 @@ export default async function register(ctx) {
 	/** Reverses the cost entries of a pay run (one per project) that still stand. */
 	async function reverseCosts(id, description, user) {
 		for (const l of await ctx.ledger.linkedEntries(`payrun-cost:${id}`)) if (!l.reversed) await reverseEntryOf(l.entry_id, description, user);
+	}
+	/** Reverses everything a posting that wasn't finished left in the books for a pay run: its own entry (if it got that far) and its cost entries. */
+	async function undoPayRunEntries(id, user) {
+		const description = `Reversal: pay run ${id} (not posted)`;
+		for (const l of await ctx.ledger.linkedEntries(`payrun:${id}`)) if (!l.reversed) await reverseEntryOf(l.entry_id, description, user);
+		await reverseCosts(id, description, user);
 	}
 
 	/**
@@ -880,13 +925,22 @@ export default async function register(ctx) {
 		const acc = await pickAccounts(b, settings, wanted);
 		if (run.gross_cents <= 0n) throw bad("This pay run has no pay on it.");
 
-		const claim = await q(`UPDATE ${S}.pay_runs SET status = 'posting' WHERE id = $1 AND status = 'draft'`, [id]);
-		if (claim.rowCount === 0) throw new ctx.HttpError(409, "Someone else is posting this pay run.");
+		// The claim: posting_at is when this posting began and says the run is this posting's (see settlePayRuns).
+		const claimed = await q(`UPDATE ${S}.pay_runs SET status = 'posting', posting_at = clock_timestamp() WHERE id = $1 AND status = 'draft' RETURNING posting_at::text AS claim`, [id]);
+		if (claimed.rows.length === 0) throw new ctx.HttpError(409, "Someone else is posting this pay run.");
+		const claim = claimed.rows[0].claim;
 		// The costs, one entry per project (tagged with its customer and the project), go to the Wages payable
 		// clearing account; the pay run's own entry clears it to payroll liabilities and the account pay comes from.
 		const posted = [];
 		let entry;
+		/** Reverses what this posting put in the books; one that can't be reversed is logged, the rest still are. */
+		const undoPosting = async (ids) => {
+			for (const p of ids)
+				await reverseEntryOf(p, `Reversal: pay run ${id} (not posted)`, req.user).catch((e) => ctx.log.error("could not reverse an entry of a pay run that wasn't posted", { pay_run: String(id), entry: String(p), error: String(e?.message ?? e) }));
+		};
 		try {
+			// Entries an earlier posting left standing (it was given up on and the server stopped before it undid them).
+			await undoPayRunEntries(id, req.user);
 			const wages = await wagesAccount(run.currency);
 			for (const g of await costGroups(id)) {
 				const what = g.project ? g.project.name : "no project";
@@ -924,16 +978,22 @@ export default async function register(ctx) {
 				req.user,
 			);
 		} catch (e) {
-			for (const p of posted) await reverseEntryOf(p, `Reversal: pay run ${id} (not posted)`, req.user).catch(() => {});
-			await q(`UPDATE ${S}.pay_runs SET status = 'draft' WHERE id = $1 AND status = 'posting'`, [id]);
+			await undoPosting(posted);
+			await q(`UPDATE ${S}.pay_runs SET status = 'draft', posting_at = NULL WHERE id = $1 AND status = 'posting' AND posting_at = $2::timestamptz`, [id, claim]);
 			throw e;
 		}
-		await q(`UPDATE ${S}.pay_runs SET status = 'posted', journal_entry_id = $2, paid_from_account = $3, posted_by = $4, posted_at = now() WHERE id = $1`, [
-			id,
-			entry.id,
-			paidFrom,
-			req.user.username,
-		]);
+		// Posted only if the run is still this posting's. If it was taken for unfinished meanwhile, its
+		// entries were reversed and it may be a draft or posting again: marking it posted now would leave
+		// a posted run with reversed wage costs.
+		const done = await q(
+			`UPDATE ${S}.pay_runs SET status = 'posted', journal_entry_id = $2, paid_from_account = $3, posted_by = $4, posted_at = now()
+			WHERE id = $1 AND status = 'posting' AND posting_at = $5::timestamptz`,
+			[id, entry.id, paidFrom, req.user.username, claim],
+		);
+		if (done.rowCount === 0) {
+			await undoPosting([...posted, entry.id]);
+			throw new ctx.HttpError(409, "Posting this pay run took too long and was given up on: nothing of it is left in the books. Post it again.");
+		}
 		// Its hours are now paid: say so in timesheet.io.
 		await q(`UPDATE ${S}.time_entries SET push_status = 'pending', push_error = '', updated_at = now() WHERE pay_run_id = $1`, [id]);
 		pushSoon(req);
@@ -1100,11 +1160,13 @@ export default async function register(ctx) {
 
 	/** Hours deleted in timesheet.io: gone here too, and out of the clearing account. */
 	async function dropPulled(id, who) {
-		const { rows } = await q(
-			`DELETE FROM ${S}.time_entries WHERE id = $1 AND billing_id IS NULL AND pay_run_id IS NULL AND billed_tag_entry_id IS NULL AND push_status = 'synced' RETURNING clearing_entry_id`,
-			[id],
+		const OPEN = `id = $1 AND billing_id IS NULL AND pay_run_id IS NULL AND billed_tag_entry_id IS NULL AND push_status = 'synced'`;
+		const { rows } = await q(`SELECT clearing_entry_id FROM ${S}.time_entries WHERE ${OPEN}`, [id]);
+		if (rows.length === 0) return; // changed in Ledger meanwhile: it stays
+		// The clearing transaction first, as when a person deletes the hours.
+		await reverseThenDelete(id, rows[0].clearing_entry_id, `Reversal: billable hours of time entry ${id} (deleted in timesheet.io by ${who})`.slice(0, 500), undefined, async () =>
+			(await q(`DELETE FROM ${S}.time_entries WHERE ${OPEN} RETURNING id`, [id])).rows,
 		);
-		if (rows.length) await unclear(rows[0].clearing_entry_id, `Reversal: billable hours of time entry ${id} (deleted in timesheet.io by ${who})`.slice(0, 500));
 	}
 
 	async function syncNow(settings, who) {
@@ -1194,22 +1256,31 @@ export default async function register(ctx) {
 				return r.rows[0].id;
 			}
 
+			// Its task was deleted in timesheet.io, or is gone from there.
+			const gone = async (have) => {
+				if (mine(have)) await keep(have); // made again in timesheet.io
+				else {
+					await dropPulled(have.id, who);
+					n.removed++;
+				}
+			};
 			for (const raw of tasks) {
 				const t = readTask(raw);
 				if (!t) {
-					n.skipped++;
+					// One Ledger can't use as it is now (running again, no end, no user) is still in timesheet.io:
+					// the hours Ledger has for it stay (they aren't "gone from timesheet.io" below), unless it was deleted there.
+					const id = typeof raw?.id === "string" ? raw.id.slice(0, 200) : null;
+					if (id !== null) seen.add(id);
+					const have = id === null ? undefined : known.get(id);
+					if (have && raw.deleted === true && !deleting.has(id)) await gone(have);
+					else n.skipped++;
 					continue;
 				}
 				seen.add(t.id);
 				if (deleting.has(t.id)) continue; // deleted in Ledger; the deletion is on its way
 				const have = known.get(t.id);
 				if (t.deleted) {
-					if (!have) continue;
-					if (mine(have)) await keep(have); // made again in timesheet.io
-					else {
-						await dropPulled(have.id, who);
-						n.removed++;
-					}
+					if (have) await gone(have);
 					continue;
 				}
 				if (have && t.last_update_ms !== null && have.timesheet_last_update_ms !== null && BigInt(t.last_update_ms) === have.timesheet_last_update_ms) continue; // unchanged
@@ -1240,14 +1311,7 @@ export default async function register(ctx) {
 			}
 			// Entries whose task is gone from timesheet.io (only when the whole window was read).
 			if (complete && tasks.length > 0)
-				for (const [taskId, have] of known)
-					if (!seen.has(taskId) && have.work_date > since) {
-						if (mine(have)) await keep(have);
-						else {
-							await dropPulled(have.id, who);
-							n.removed++;
-						}
-					}
+				for (const [taskId, have] of known) if (!seen.has(taskId) && have.work_date > since) await gone(have);
 
 			const after = n.kept ? await push(settings) : { sent: 0, failed: 0, ledger_only: 0, deleted: 0 };
 			const out = { sent: sent.sent + after.sent, failed: after.failed || sent.failed, deleted: sent.deleted + after.deleted, ledger_only: sent.ledger_only };

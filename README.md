@@ -42,6 +42,10 @@ newer). Install it under **Settings → Modules** by entering this repository's
 
   The pay run's page shows the cost by project before you post. A posted pay
   run can be reversed: all its entries are, and its hours go back to unpaid.
+  If the server stops while a pay run is being posted, the next time a
+  bookkeeper or admin opens Pay runs (2 minutes after the posting began, at
+  the earliest) what it had put in the books is reversed and the run is a
+  draft again, to be posted once more.
 - **People**: employees (hourly or salary, pay rate, billing rate, the
   percentages a pay run starts from) and projects (the customer they are
   billed to and an hourly rate). Customers are Ledger's shared **Entities**.
@@ -157,7 +161,8 @@ The sync goes both ways.
   customer already in Entities with the same name, otherwise you choose one;
 - each finished task becomes a time entry: its length minus its breaks, on the
   day it started, billable or not as in timesheet.io. Running timers, mileage
-  and calls are left out;
+  and calls are left out; a task that is running again keeps the hours Ledger
+  already has for it until it is finished;
 - edits and deletions made in timesheet.io are applied (but see *Ledger wins*).
 
 **To timesheet.io**:
@@ -214,7 +219,11 @@ npm test    # nothing to install; needs a Ledger checkout and PostgreSQL, see te
 `test/run.sh` runs Ledger's module checker, serves the module in a real Ledger
 on a scratch database with `test/mock-timesheet.mjs` standing in for
 timesheet.io (`TIMESHEET_API_URL`), and runs `test/flow.mjs` through time,
-sync, billing, tags and payroll.
+sync, billing, tags and payroll. `LEDGER_DIR` is the Ledger checkout;
+`LEDGER_PORT` (8098) and `MOCK_PORT` (8099) choose other ports. With `psql`
+installed it also posts pay runs while another request loads Pay runs (the
+test reaches into the scratch database to age a draft and to make a posting
+look hung); without it that part is skipped.
 
 ## Releasing
 

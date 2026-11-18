@@ -1,14 +1,26 @@
 // End-to-end test of the real flows against a served Ledger (see README → Testing):
-//   node test/flow.mjs http://127.0.0.1:8098 '<ledger_session cookie value>' http://127.0.0.1:8099
+//   node test/flow.mjs http://127.0.0.1:8098 '<ledger_session cookie value>' http://127.0.0.1:8099 [<scratch database URL>]
+// With the scratch database's URL (test/run.sh passes it) and psql, the flows that need a look
+// inside run too: a pay run posted while another request settles pay runs.
 import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
 
-const [base, cookie, mock] = process.argv.slice(2);
-const call = async (method, path, body) => {
-	const r = await fetch(base + path, { method, headers: { "Content-Type": "application/json", Cookie: `ledger_session=${cookie}`, Origin: base }, body: body === undefined ? undefined : JSON.stringify(body) });
+const [base, cookie, mock, db] = process.argv.slice(2);
+const call = async (method, path, body, as = cookie) => {
+	const r = await fetch(base + path, { method, headers: { "Content-Type": "application/json", Cookie: `ledger_session=${as}`, Origin: base }, body: body === undefined ? undefined : JSON.stringify(body) });
 	const text = await r.text();
 	return { status: r.status, body: text ? JSON.parse(text) : null };
 };
-const m = (method, path, body) => call(method, `/api/v1/m/employees${path}`, body);
+const m = (method, path, body, as) => call(method, `/api/v1/m/employees${path}`, body, as);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const psql = (sql) => execFileSync("psql", ["-X", "-At", "-v", "ON_ERROR_STOP=1", db, "-c", sql], { stdio: ["ignore", "pipe", "pipe"] }).toString().trim();
+const canPsql = (() => {
+	try {
+		return Boolean(db) && psql("SELECT 1") === "1";
+	} catch {
+		return false;
+	}
+})();
 const ok = async (p, status = 200) => {
 	const r = await p;
 	assert.equal(r.status, status, JSON.stringify(r.body));
@@ -242,6 +254,48 @@ await settle();
 assert.equal((await mt("t1")).billed, false);
 step("billed taken off: hours open again, billed no more in timesheet.io");
 
+// A task timesheet.io still has but Ledger can't read as it is now (running again) is not "gone from timesheet.io"
+const t4now = await entryBy((t) => t.description === "Task t4");
+const tasksBefore = await mockTasks();
+const setTasks = (list) => fetch(`${mock}/__tasks`, { method: "POST", body: JSON.stringify(list) });
+await setTasks(tasksBefore.map((t) => (t.id === "t4" ? { ...t, running: true, endDateTime: undefined } : t)));
+const s4 = await settle();
+assert.deepEqual([s4.added, s4.updated, s4.removed, s4.skipped], [0, 0, 0, 2], s4.summary); // t4, and t5 as before
+const t4kept = await entryBy((t) => t.description === "Task t4");
+assert.deepEqual([t4kept.id, String(t4kept.clearing_entry_id), t4kept.minutes], [t4now.id, String(t4now.clearing_entry_id), t4now.minutes]);
+assert.equal((await journal(t4now.clearing_entry_id)).reversed_by_id, null); // its billable item stays
+await setTasks(tasksBefore);
+const s5 = await settle();
+assert.deepEqual([s5.added, s5.updated, s5.removed, s5.skipped], [0, 0, 0, 1], s5.summary);
+// ...but one that was deleted there goes, readable or not
+const zz = { ...tasksBefore.find((t) => t.id === "bulk1"), id: "zz1", description: "Task zz1", startDateTime: `${day(8)}T07:00:00+02:00`, endDateTime: `${day(8)}T07:30:00+02:00`, lastUpdate: 5000 };
+await setTasks([...tasksBefore, zz]);
+assert.equal((await settle()).added, 1);
+await setTasks([...tasksBefore, { ...zz, running: true, endDateTime: undefined, deleted: true, lastUpdate: 5001 }]);
+const s6 = await settle();
+assert.deepEqual([s6.removed, s6.skipped], [1, 1], s6.summary);
+assert.equal(await entryBy((t) => t.description === "Task zz1"), undefined);
+await setTasks(tasksBefore);
+step("a task Ledger can't read right now (running again) keeps its hours; a deleted one goes");
+
+// Deleting hours reverses their transaction first: when that is refused (here: the clearing account
+// is inactive), the hours stay, instead of going while their billable item stays behind
+const held = await ok(m("POST", "/time", { employee_id: ana.id, project_id: web.id, work_date: day(7), minutes: 60, billable: true, description: "Reversal refused" }), 201);
+const heldEntry = (await entryBy((t) => t.id === held.id)).clearing_entry_id;
+assert.deepEqual(await sortCents(acme.id), [12000, 24000, 36000, 84000]);
+await ok(call("PATCH", `/api/v1/accounts/${BILLABLE}`, { is_active: false }));
+const refused = await m("DELETE", `/time/${held.id}`);
+assert.ok(refused.status >= 400 && refused.status < 500, JSON.stringify(refused));
+assert.equal(String((await entryBy((t) => t.id === held.id)).clearing_entry_id), String(heldEntry));
+assert.equal((await journal(heldEntry)).reversed_by_id, null);
+await ok(call("PATCH", `/api/v1/accounts/${BILLABLE}`, { is_active: true }));
+await ok(m("DELETE", `/time/${held.id}`), 204);
+assert.notEqual((await journal(heldEntry)).reversed_by_id, null);
+assert.equal(await entryBy((t) => t.id === held.id), undefined);
+assert.deepEqual(await sortCents(acme.id), [24000, 36000, 84000]);
+await settle();
+step("hours whose transaction can't be reversed are not deleted");
+
 // Payroll
 await ok(m("POST", "/pay-runs", { period_start: "2020-01-01", period_end: "2019-01-01" }), 422);
 const run = await ok(m("POST", "/pay-runs", { period_start: day(40), period_end: day(0), pay_date: day(0) }), 201);
@@ -294,6 +348,102 @@ assert.equal(Number((await ok(call("GET", "/api/v1/accounts/5200"))).balance_cen
 await settle();
 assert.equal((await mt("bulk3")).paid, false);
 step("pay run drafted, edited, posted (balanced entry) and reversed; paid in timesheet.io and back");
+
+// A pay run and the books always agree, whatever else is going on: posted with every entry standing,
+// or a draft with every entry reversed.
+if (canPsql) {
+	const ACCOUNTS = { paid_from_account: "1000", wages_expense_account: "5200", payroll_liabilities_account: "2300", employer_cost_account: "5210" };
+	const entriesOf = async (id) => (await ok(call("GET", `/api/v1/journal-entries?account_code=${WAGES}&limit=500`))).data.filter((e) => e.reference === `PAYRUN-${id}` && e.reverses_id == null);
+	const agree = async (id, what) => {
+		const now = await ok(m("GET", `/pay-runs/${id}`));
+		const all = await entriesOf(id);
+		const standing = all.filter((e) => e.reversed_by_id == null).length;
+		// 4 cost entries (one per project, and one for the salary) and the pay run's own
+		if (now.status === "posted") assert.equal(standing, 5, `${what}: posted, but only ${standing} of its 5 entries stand`);
+		else assert.deepEqual([now.status, standing], ["draft", 0], `${what}: ${now.status}, with ${standing} of its entries still standing`);
+		assert.equal(Number((await ok(call("GET", `/api/v1/accounts/${WAGES}`))).balance_cents), 0, what);
+		return now.status;
+	};
+	const draft = async () => (await ok(m("POST", "/pay-runs", { period_start: day(40), period_end: day(0), pay_date: day(0) }), 201)).id;
+	const wagesBefore = Number((await ok(call("GET", "/api/v1/accounts/5200"))).balance_cents);
+
+	// 1. A draft made yesterday is posted while another tab loads Pay runs: that is not a posting the
+	//    server didn't finish (which is told by when posting began, not when the draft was made).
+	for (const delay of [5, 15, 25, 35, 45, 60]) {
+		const id = await draft();
+		psql(`UPDATE mod_employees.pay_runs SET created_at = now() - interval '1 day' WHERE id = ${id}`);
+		const tab = (async () => {
+			await sleep(delay);
+			const gets = [];
+			for (let i = 0; i < 4; i++) {
+				gets.push(ok(m("GET", "/pay-runs")));
+				await sleep(10);
+			}
+			await Promise.all(gets);
+		})();
+		await ok(m("POST", `/pay-runs/${id}/post`, ACCOUNTS));
+		await tab;
+		assert.equal(await agree(id, `posted with Pay runs loaded ${delay} ms in`), "posted");
+		await ok(m("POST", `/pay-runs/${id}/reverse`));
+	}
+	step("a draft made yesterday posts while another tab loads Pay runs");
+
+	// 2. A posting given up on while it is in fact still running (here: its posting_at is put 3 minutes
+	//    back mid-way, as if it had hung that long): it must not mark the run posted afterwards, and what
+	//    it and the settling request posted and reversed must add up to nothing.
+	let gaveUp = 0;
+	for (let round = 0; round < 3; round++) {
+		const id = await draft();
+		const hang = spawn("psql", ["-X", "-q", "-v", "ON_ERROR_STOP=1", db, "-c",
+			`DO $$ BEGIN FOR i IN 1..400 LOOP
+				UPDATE mod_employees.pay_runs SET posting_at = posting_at - interval '3 minutes' WHERE id = ${id} AND status = 'posting' AND posting_at > now() - interval '2 minutes';
+				COMMIT; PERFORM pg_sleep(0.004);
+			END LOOP; END $$`], { stdio: "ignore" });
+		const hung = new Promise((r) => hang.on("close", r));
+		await sleep(150); // psql is connected and looping
+		let posting = true;
+		const tab = (async () => {
+			while (posting) {
+				await m("GET", "/pay-runs");
+				await sleep(5);
+			}
+		})();
+		const post = await m("POST", `/pay-runs/${id}/post`, ACCOUNTS);
+		posting = false;
+		await tab;
+		assert.equal(await hung, 0);
+		assert.ok(post.status === 200 || post.status === 409, JSON.stringify(post));
+		await ok(m("GET", "/pay-runs")); // settles what is left: the run is a draft again
+		const status = await agree(id, "posting given up on while still running");
+		assert.equal(status, post.status === 200 ? "posted" : "draft");
+		if (status === "draft") {
+			gaveUp++;
+			// and it can simply be posted again
+			await ok(m("POST", `/pay-runs/${id}/post`, ACCOUNTS));
+			assert.equal(await agree(id, "posted again"), "posted");
+		}
+		await ok(m("POST", `/pay-runs/${id}/reverse`));
+	}
+	assert.ok(gaveUp > 0, "no round gave a posting up mid-way");
+	step(`a posting given up on mid-way leaves nothing behind and the run a draft (${gaveUp} of 3 rounds)`);
+
+	// 3. A posting the server really didn't finish is settled when a bookkeeper loads Pay runs, never by a viewer.
+	const id = await draft();
+	psql(`UPDATE mod_employees.pay_runs SET status = 'posting', posting_at = now() - interval '3 minutes' WHERE id = ${id}`);
+	const vera = await call("POST", "/api/v1/users", { username: "vera", password: "viewer-password-1", role: "viewer" });
+	assert.ok(vera.status === 200 || vera.status === 201, JSON.stringify(vera));
+	const login = await fetch(`${base}/api/v1/auth/login`, { method: "POST", headers: { "Content-Type": "application/json", Origin: base }, body: JSON.stringify({ username: "vera", password: "viewer-password-1" }) });
+	const viewer = /ledger_session=([^;]+)/.exec(login.headers.get("set-cookie") ?? "")?.[1];
+	assert.ok(viewer, "the viewer signed in");
+	const seenBy = async (as) => (await ok(m("GET", "/pay-runs", undefined, as))).data.find((r) => r.id === id).status;
+	assert.equal(await seenBy(viewer), "posting"); // a viewer only reads
+	assert.equal(psql(`SELECT status FROM mod_employees.pay_runs WHERE id = ${id}`), "posting");
+	assert.equal(await seenBy(cookie), "draft");
+	await ok(m("DELETE", `/pay-runs/${id}`), 204);
+	assert.equal(Number((await ok(call("GET", "/api/v1/accounts/5200"))).balance_cents), wagesBefore);
+	await settle();
+	step("an unfinished posting is settled for a bookkeeper, not by a viewer's visit");
+} else console.log("  skip  pay runs posted while they are settled (needs psql and the scratch database's URL: test/run.sh)");
 
 // Root mode: any record, through ctx.root (kept by Ledger, reversible); the books and timesheet.io are left alone
 await ok(m("DELETE", "/billings/999"), 403); // not in root mode
