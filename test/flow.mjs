@@ -298,6 +298,18 @@ step("hours whose transaction can't be reversed are not deleted");
 
 // Payroll
 await ok(m("POST", "/pay-runs", { period_start: "2020-01-01", period_end: "2019-01-01" }), 422);
+// Only the chosen employees: Ben's hours alone; the others' stay unpaid for the full run below
+await ok(m("POST", "/pay-runs", { period_start: day(40), period_end: day(0), employee_ids: [] }), 422);
+await ok(m("POST", "/pay-runs", { period_start: day(40), period_end: day(0), employee_ids: ["x"] }), 422);
+await ok(m("POST", "/pay-runs", { period_start: day(40), period_end: day(0), employee_ids: [99999999] }), 422);
+{
+	const ben = (await ok(m("GET", "/employees"))).data.find((e) => e.name === "Ben Okafor");
+	const only = await ok(m("POST", "/pay-runs", { period_start: day(40), period_end: day(0), employee_ids: [ben.id] }), 201);
+	assert.deepEqual(only.lines.map((l) => l.employee_name), ["Ben Okafor"]);
+	assert.equal(only.lines[0].gross_cents, 5.5 * 5000);
+	await ok(m("DELETE", `/pay-runs/${only.id}`), 204); // its hours go back to unpaid
+}
+step("a pay run for only the chosen employees");
 const run = await ok(m("POST", "/pay-runs", { period_start: day(40), period_end: day(0), pay_date: day(0) }), 201);
 const line = (n) => run.lines.find((l) => l.employee_name === n);
 // Ana: 2 h manual + 3 h + 7 h + 118 × 0.5 h = 71 h at 40.00; Ben: 2.5 h + 2 h + the 1 h moved to him

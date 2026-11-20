@@ -27,7 +27,9 @@ newer). Install it under **Settings → Modules** by entering this repository's
   puts on the transaction marks the hours billed here (and locks them); a
   **paid** tag marks them paid. See *Invoicing billed hours* below.
 - **Payroll**: a pay run takes every hour in a period that isn't on a pay run
-  yet (hourly employees) plus one period's pay for each salaried employee.
+  yet (hourly employees) plus one period's pay for each salaried employee,
+  for everyone or only the employees you tick (their hours left out stay
+  unpaid for a later run).
   You review the draft, correct gross pay, deductions and employer cost per
   person, then post it. **Its cost is split by project**: one entry per
   project, tagged with the **project** and its **customer** (hourly pay split

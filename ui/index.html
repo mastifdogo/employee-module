@@ -571,6 +571,27 @@
 		const from = h("input", { type: "date", required: true, value: pf });
 		const to = h("input", { type: "date", required: true, value: pt });
 		const pay = h("input", { type: "date", required: true, value: today() });
+		// Who the run is for: everyone is ticked to start with; untick anyone to leave them out.
+		const people = st.employees;
+		const chosen = new Set(people.map((e) => e.id));
+		const counted = h("small", {});
+		const all = allBox(chosen, people.map((e) => e.id), () => redraw(), "Everyone");
+		const boxes = people.map((e) => ({ id: e.id, box: pickBox(chosen, e.id, () => redraw()) }));
+		const redraw = () => {
+			all.sync();
+			for (const b of boxes) b.box.checked = chosen.has(b.id);
+			counted.textContent = chosen.size === people.length ? "Everyone" : `${chosen.size} of ${people.length} employees`;
+		};
+		redraw();
+		const picker = people.length > 0 && h(
+			"details",
+			{},
+			h("summary", {}, "Employees: ", counted),
+			h("div", { class: "row", style: "flex-wrap: wrap; gap: 0.2rem 1rem; margin-top: 0.4rem" },
+				h("label", { class: "check" }, all, "Everyone"),
+				people.map((e, i) => h("label", { class: "check" }, boxes[i].box, e.name, !e.is_active && h("small", { class: "muted" }, " (inactive)"))),
+			),
+		);
 		put($("main"), 
 			canEdit() &&
 				h(
@@ -578,14 +599,18 @@
 					{
 						class: "card",
 						onsubmit: act(async () => {
-							const run = await send("POST", "/pay-runs", { period_start: from.value, period_end: to.value, pay_date: pay.value });
+							if (chosen.size === 0) return say("Choose at least one employee for the pay run.", true);
+							const b = { period_start: from.value, period_end: to.value, pay_date: pay.value };
+							if (chosen.size < people.length) b.employee_ids = [...chosen];
+							const run = await send("POST", "/pay-runs", b);
 							openRun = run.id;
 							await Promise.all([showPayroll(), refreshSummary()]);
 						}),
 					},
 					h("h3", {}, "New pay run"),
-					h("p", { class: "muted" }, "Takes every hour in the period that isn't on a pay run yet (hourly employees) plus one period's pay for each salaried employee. You review it as a draft before anything is posted."),
+					h("p", { class: "muted" }, "Takes every hour in the period that isn't on a pay run yet (hourly employees) plus one period's pay for each salaried employee, for the employees you choose (everyone unless you untick some). You review it as a draft before anything is posted."),
 					h("div", { class: "row" }, field("Hours from", from), field("To", to), field("Pay date", pay), h("button", { type: "submit" }, "Start draft")),
+					picker,
 				),
 			data.length === 0
 				? empty("No pay runs yet.")

@@ -830,6 +830,18 @@ export default async function register(ctx) {
 		if (to < from) throw bad("the period ends before it starts");
 		const payDate = b.pay_date === undefined ? today() : reqDate(b.pay_date, "pay date");
 		const currency = currencyOf(await ctx.settings.get());
+		// Only these employees when given (the ones the user ticked); otherwise everyone.
+		let only = null;
+		if (b.employee_ids !== undefined && b.employee_ids !== null) {
+			if (!Array.isArray(b.employee_ids) || b.employee_ids.length === 0 || b.employee_ids.length > 5000) throw bad("Choose at least one employee for the pay run.");
+			only = [...new Set(b.employee_ids.map((v) => {
+				const n = typeof v === "string" && /^\d{1,15}$/.test(v) ? Number(v) : v;
+				if (!Number.isSafeInteger(n) || n < 1) throw bad("employee_ids must be employee ids");
+				return n;
+			}))];
+			const found = await q(`SELECT count(*)::int AS n FROM ${S}.employees WHERE id = ANY($1::bigint[])`, [only]);
+			if (found.rows[0].n !== only.length) throw bad("One of the chosen employees doesn't exist.");
+		}
 		// One statement: the run, the hourly time it pays (claimed so no other run takes it) and a line per employee.
 		const { rows } = await q(
 			`WITH run AS (
@@ -838,6 +850,7 @@ export default async function register(ctx) {
 				UPDATE ${S}.time_entries t SET pay_run_id = (SELECT id FROM run), updated_at = now()
 				FROM ${S}.employees e
 				WHERE e.id = t.employee_id AND e.pay_type = 'hourly' AND t.pay_run_id IS NULL AND t.work_date BETWEEN $1 AND $2
+					AND ($6::bigint[] IS NULL OR e.id = ANY($6::bigint[]))
 				RETURNING t.employee_id, t.minutes
 			), worked AS (
 				SELECT employee_id, sum(minutes)::int AS minutes FROM claimed GROUP BY employee_id
@@ -848,15 +861,18 @@ export default async function register(ctx) {
 				FROM ${S}.employees e
 				LEFT JOIN worked w ON w.employee_id = e.id
 				CROSS JOIN LATERAL (SELECT CASE WHEN e.pay_type = 'salary' THEN e.pay_rate_cents ELSE round(COALESCE(w.minutes, 0) * e.pay_rate_cents / 60.0)::bigint END AS gross) g
-				WHERE (e.pay_type = 'salary' AND e.is_active AND e.pay_rate_cents > 0) OR w.minutes > 0
+				WHERE ((e.pay_type = 'salary' AND e.is_active AND e.pay_rate_cents > 0) OR w.minutes > 0)
+					AND ($6::bigint[] IS NULL OR e.id = ANY($6::bigint[]))
 				RETURNING 1
 			)
 			SELECT (SELECT id FROM run) AS id, (SELECT count(*)::int FROM lines) AS lines`,
-			[from, to, payDate, currency, req.user.username],
+			[from, to, payDate, currency, req.user.username, only],
 		);
 		if (rows[0].lines === 0) {
 			await q(`DELETE FROM ${S}.pay_runs WHERE id = $1`, [rows[0].id]);
-			throw bad(`Nothing to pay from ${from} to ${to}: no unpaid hours for hourly employees and no salaried employees.`);
+			throw bad(only
+				? `Nothing to pay from ${from} to ${to} for the chosen ${only.length === 1 ? "employee" : "employees"}: no unpaid hours, and no active salaried employee among them.`
+				: `Nothing to pay from ${from} to ${to}: no unpaid hours for hourly employees and no salaried employees.`);
 		}
 		return ctx.response(201, await getRun(rows[0].id));
 	});
