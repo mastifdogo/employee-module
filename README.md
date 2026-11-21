@@ -136,6 +136,16 @@ and every module (Ledger ≥ 0.23.0).
   timesheet.io straight away, not at the next sync. Tags changed while Ledger
   was down are read again when the module starts, and sent then.
 
+## Linked entries
+
+On Ledger 0.28.0 and later, a posted pay run's journal entry is linked to its
+wage-cost entries (one per project), so opening any of them in Ledger shows
+the others. Pay runs posted before are linked when the module next starts.
+Billable hours show with the invoice that bills them once Sales (0.21.0)
+links them. The old entry link "Billed" on billings from before 0.4.0 is
+taken off there: Ledger would show every such billing as linked to the
+others, and the tag "billed" already says it.
+
 ## timesheet.io
 
 1. In timesheet.io open **my.timesheet.io → Development → API keys**

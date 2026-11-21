@@ -338,6 +338,9 @@ const byProject = Object.fromEntries((await ok(m("GET", `/pay-runs/${run.id}`)))
 assert.deepEqual(byProject, { Audit: [8000, 0], "Internal ops": [253500, 0], "Website rebuild": [50000, 0], "-": [300000, 15000] });
 const costEntries = (await ok(call("GET", "/api/v1/journal-entries?account_code=5200&limit=50"))).data.filter((e) => e.reference === `PAYRUN-${run.id}`);
 assert.equal(costEntries.length, 4);
+// Linked entries (Ledger 0.28.0): the pay run's entry shows its wage-cost entries, and each of them shows it
+assert.deepEqual(pe.related.filter((r) => r.why.some((w) => w.kind === "linked" && w.module_id === "employees")).map((r) => r.id).sort(), costEntries.map((e) => e.id).sort());
+assert.ok((await journal(costEntries[0].id)).related.some((r) => r.id === pe.id && r.direct));
 assert.equal(costEntries.reduce((a, e) => a + amt(e, "5200", "debit_cents"), 0), Number(edited.gross_cents));
 const costOf = (what) => costEntries.find((e) => e.description.endsWith(`· ${what}`));
 assert.deepEqual(await tagsOf(costOf("Website rebuild").id), [["customer", "employees", "Acme Corp"], ["project", "employees", null]]);

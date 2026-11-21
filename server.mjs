@@ -1010,11 +1010,27 @@ export default async function register(ctx) {
 			await undoPosting([...posted, entry.id]);
 			throw new ctx.HttpError(409, "Posting this pay run took too long and was given up on: nothing of it is left in the books. Post it again.");
 		}
+		await linkRunEntries(id, entry.id, posted, req.user);
 		// Its hours are now paid: say so in timesheet.io.
 		await q(`UPDATE ${S}.time_entries SET push_status = 'pending', push_error = '', updated_at = now() WHERE pay_run_id = $1`, [id]);
 		pushSoon(req);
 		return getRun(id);
 	});
+
+	/**
+	 * Links a posted pay run's entry to its wage-cost entries (Ledger 0.28.0), so opening one in
+	 * Ledger shows the others. Nothing on an older Ledger; a failure never undoes the posting, and
+	 * the run is tried again at the next start.
+	 */
+	async function linkRunEntries(id, entryId, costIds, user) {
+		if (typeof ctx.ledger.relateEntries !== "function") return;
+		try {
+			for (const cost of costIds) await ctx.ledger.relateEntries(entryId, cost, { note: `Wage costs of pay run ${id}` }, user);
+			await q(`UPDATE ${S}.pay_runs SET entries_linked = true WHERE id = $1`, [id]);
+		} catch (e) {
+			ctx.log.warn("could not link a pay run's journal entries to each other", { pay_run: String(id), error: String(e?.message ?? e) });
+		}
+	}
 
 	ctx.route("POST", "/pay-runs/:id/reverse", async (req) => {
 		const id = paramId(req, "pay run");
@@ -1593,13 +1609,23 @@ export default async function register(ctx) {
 					try {
 						const entry = await ctx.ledger.getJournalEntry(r.journal_entry_id);
 						if (entry.reversed_by_id !== null) continue;
-						if (!entry.links.some((l) => l.module_id === ctx.id && l.ref === BILLED_TAG.ref)) await ctx.ledger.linkJournalEntry(r.journal_entry_id, { ...BILLED_TAG, href: billingHref(r.id) });
+						// From Ledger 0.28.0 entries with the same link show as linked to each other, which billings
+						// of different customers aren't: there the older mark goes, the tag "billed" says it.
+						const marked = entry.links.some((l) => l.module_id === ctx.id && l.ref === BILLED_TAG.ref);
+						if (typeof ctx.ledger.relateEntries === "function") {
+							if (marked) await ctx.ledger.unlinkJournalEntry(r.journal_entry_id, BILLED_TAG.ref);
+						} else if (!marked) await ctx.ledger.linkJournalEntry(r.journal_entry_id, { ...BILLED_TAG, href: billingHref(r.id) });
 						if (r.entry_tagged) continue;
 						const tags = await tagBilled(r.journal_entry_id, r.customer_entity_id, r.id, undefined, true);
 						if (tags) await q(`UPDATE ${S}.billings SET entry_tagged = true, entry_paid = $2 WHERE id = $1`, [r.id, isPaid(tags)]);
 					} catch {
 						// the entry is gone (restored from elsewhere): nothing to tag
 					}
+				}
+				// Pay runs posted before 0.15.0: their entry and wage-cost entries are linked to each other.
+				for (const r of (await q(`SELECT id, journal_entry_id FROM ${S}.pay_runs WHERE status = 'posted' AND journal_entry_id IS NOT NULL AND NOT entries_linked ORDER BY id LIMIT 2000`)).rows) {
+					const costs = (await ctx.ledger.linkedEntries(`payrun-cost:${r.id}`).catch(() => [])).filter((l) => !l.reversed).map((l) => l.entry_id);
+					await linkRunEntries(r.id, r.journal_entry_id, costs);
 				}
 				await serial(org.id, () => postClearing());
 				if (ctx.tags) {
