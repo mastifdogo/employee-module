@@ -603,8 +603,7 @@
 							const b = { period_start: from.value, period_end: to.value, pay_date: pay.value };
 							if (chosen.size < people.length) b.employee_ids = [...chosen];
 							const run = await send("POST", "/pay-runs", b);
-							openRun = run.id;
-							await Promise.all([showPayroll(), refreshSummary()]);
+							await Promise.all([go(`#/payroll/${run.id}`), refreshSummary()]);
 						}),
 					},
 					h("h3", {}, "New pay run"),
@@ -627,7 +626,7 @@
 								h("td", { class: "n" }, `${money(r.gross_cents)} ${r.currency}`),
 								h("td", { class: "n" }, money(r.net_cents)),
 								h("td", {}, chip(r.status, r.status === "posted" ? "ok" : r.status === "reversed" ? "bad" : "warn")),
-								h("td", {}, h("button", { class: "plain small", onclick: act(() => ((openRun = r.id), showPayroll())) }, r.status === "draft" && canEdit() ? "Review" : "Open")),
+								h("td", {}, h("button", { class: "plain small", onclick: act(() => go(`#/payroll/${r.id}`)) }, r.status === "draft" && canEdit() ? "Review" : "Open")),
 							),
 						),
 					),
@@ -645,7 +644,7 @@
 		}
 		const draft = run.status === "draft" && canEdit();
 		const editable = draft || isRoot(); // root may correct a posted run's amounts
-		const back = () => ((openRun = null), Promise.all([showPayroll(), refreshSummary()]));
+		const back = () => Promise.all([go("#/payroll"), refreshSummary()]); // after deleting the run
 		const amount = (line, key) =>
 			editable
 				? h("input", {
@@ -663,7 +662,6 @@
 					})
 				: money(line[key]);
 		put($("main"), 
-			h("p", {}, h("button", { class: "plain small", onclick: act(back) }, "← All pay runs")),
 			h("h2", {}, `Pay run ${run.id} · ${run.period_start} to ${run.period_end} `, chip(run.status, run.status === "posted" ? "ok" : run.status === "reversed" ? "bad" : "warn")),
 			h("p", { class: "muted" }, `Pay date ${run.pay_date} · ${run.currency}`, run.posted_by ? ` · posted by ${run.posted_by}` : "", run.paid_from_account ? ` from account ${run.paid_from_account}` : "", run.reversed_by ? ` · reversed by ${run.reversed_by}` : ""),
 			run.journal_entry_id !== null && h("p", {}, h("a", { href: `/journal/${run.journal_entry_id}`, target: "_top" }, `Journal entry ${run.journal_entry_id}`)),
@@ -879,7 +877,7 @@
 							title: total ? `${key}: ${hrs(total)} h${billable ? `, ${hrs(billable)} h billable` : ""}. Open this day on the Time tab.` : `${key}: open this day on the Time tab.`,
 							onclick: () => {
 								Object.assign(timeFilter, { from: key, to: key, employee_id: cal.employee_id, show: "" });
-								show("time").catch(fail);
+								go("#/time").catch(fail);
 							},
 						},
 						h("span", { class: "num" }, day.getDate() === 1 ? `${shortMonth.format(day)} 1` : String(day.getDate())),
@@ -1011,12 +1009,20 @@
 	];
 	async function show(tab) {
 		st.tab = tab;
-		$("tabs").replaceChildren(...TABS.map(([id, label]) => h("button", { role: "tab", "aria-selected": String(id === tab), onclick: () => show(id).catch(fail) }, label)));
+		$("tabs").replaceChildren(...TABS.map(([id, label]) => h("button", { role: "tab", "aria-selected": String(id === tab), onclick: () => go(`#/${id}`).catch(fail) }, label)));
 		await TABS.find(([id]) => id === tab)[2]();
 	}
 
-	(async () => {
-		await loadShared();
+	// The view is in the address after "#" (#/people, #/payroll/12), so Ledger's
+	// Back button steps through the views (Ledger ≥ 0.35.4) and the page needs
+	// no back button. Without it: what the link asked for.
+	async function route() {
+		const [, tab, id] = location.hash.split("/");
+		if (TABS.some(([t]) => t === tab)) {
+			openRun = tab === "payroll" && /^\d+$/.test(id ?? "") ? Number(id) : null;
+			return show(tab);
+		}
+		openRun = null;
 		const p = new URLSearchParams(location.search);
 		if (p.get("payrun") && /^\d+$/.test(p.get("payrun"))) {
 			openRun = Number(p.get("payrun"));
@@ -1030,7 +1036,15 @@
 			const e = st.employees.find((x) => String(x.id) === p.get("employee"));
 			if (e && canEdit()) employeeDialog(e);
 		} else await show(TABS.some(([id]) => id === p.get("tab")) ? p.get("tab") : "time");
-	})().catch(fail);
+	}
+	/** Opens a view (a new step for Ledger's Back button), or shows it again when it is the one open. */
+	function go(hash) {
+		if (location.hash === hash) return route();
+		location.hash = hash;
+		return Promise.resolve(); // the hashchange below shows it
+	}
+	addEventListener("hashchange", () => route().catch(fail));
+	loadShared().then(route).catch(fail);
 </script>
 </body>
 </html>

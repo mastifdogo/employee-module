@@ -3,7 +3,7 @@
 Track employee time, bill customers for billable hours and run payroll, with
 time pulled from [timesheet.io](https://timesheet.io) through its API.
 
-A module for [Ledger](https://github.com/mastifdogo/Bookeeping) (0.23.0 or
+A module for [Ledger](https://github.com/mastifdogo/Bookeeping) (0.35.4 or
 newer). Install it under **Settings → Modules** by entering this repository's
 `owner/name`.
 
