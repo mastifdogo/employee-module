@@ -156,7 +156,7 @@ others, and the tag "billed" already says it.
 3. Ledger and timesheet.io are then synced:
    - each time someone signs in to Ledger (a setting, on by default; it runs
      within about 15 seconds of the sign-in, for the organization signed in to);
-   - with the **Sync** button beside the title of the Employees page;
+   - with the **Sync** button at the right of the tabs on the Employees page;
    - every hour, if you turn that setting on;
    - and a change made in Ledger is sent right away.
 
